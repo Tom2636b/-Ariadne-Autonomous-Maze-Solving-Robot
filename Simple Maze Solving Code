@@ -1,0 +1,254 @@
+// MOTOR PINS
+int FL1 = 2,  FL2 = 3,  FL_PWM = 4;
+int FR1 = 5,  FR2 = 6,  FR_PWM = 7;
+int BL1 = 8,  BL2 = 9,  BL_PWM = 10;
+int BR1 = 11, BR2 = 12, BR_PWM = 13;
+
+// SENSOR PINS
+int trigF = A0, echoF = A1;
+int trigL = A2, echoL = A3;
+int trigR = A4, echoR = A5;
+
+// SETTINGS
+int   speed       = 150;
+int   frontMin    = 20;
+int   wallDist    = 15;
+float Kp          = 3.0;
+
+// ── EXIT DETECTION ───────────────────────────────────────────────────────────
+#define EXIT_THRESHOLD  45   // all sensors above this = open space = exit
+#define EXIT_CONFIRM     8   // consecutive open readings before confirming exit
+#define COUNTDOWN_MS  8000   // ms to wait before speed run (time to place robot)
+int openReadings = 0;        // counts consecutive open readings
+// ─────────────────────────────────────────────────────────────────────────────
+
+// MOVE RECORDING
+#define MOVE_L 0
+#define MOVE_R 1
+#define MOVE_U 2
+#define MAX_MOVES 200
+byte moves[MAX_MOVES];
+int  moveCount = 0;
+
+// ROBOT MODE
+enum Mode  { EXPLORE, COUNTDOWN, SPEEDRUN, DONE };
+Mode mode = EXPLORE;
+
+// STATE MACHINE
+enum State { FOLLOW_WALL, FIND_WALL, AVOID_FRONT, UTURN };
+State currentState = FIND_WALL;
+State prevState    = FIND_WALL;
+
+void setup() {
+  pinMode(FL1, OUTPUT); pinMode(FL2, OUTPUT); pinMode(FL_PWM, OUTPUT);
+  pinMode(FR1, OUTPUT); pinMode(FR2, OUTPUT); pinMode(FR_PWM, OUTPUT);
+  pinMode(BL1, OUTPUT); pinMode(BL2, OUTPUT); pinMode(BL_PWM, OUTPUT);
+  pinMode(BR1, OUTPUT); pinMode(BR2, OUTPUT); pinMode(BR_PWM, OUTPUT);
+  pinMode(trigF, OUTPUT); pinMode(echoF, INPUT);
+  pinMode(trigL, OUTPUT); pinMode(echoL, INPUT);
+  pinMode(trigR, OUTPUT); pinMode(echoR, INPUT);
+  Serial.begin(9600);
+  Serial.println("=== EXPLORE MODE — searching for exit... ===");
+}
+
+// SENSOR READING (Step 1 — unchanged)
+long singleRead(int trig, int echo) {
+  digitalWrite(trig, LOW);  delayMicroseconds(5);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long duration = pulseIn(echo, HIGH, 15000);
+  if (duration == 0) return 999;
+  return duration * 0.034 / 2;
+}
+
+long readSensor(int trig, int echo) {
+  long a = singleRead(trig, echo); delay(5);
+  long b = singleRead(trig, echo); delay(5);
+  long c = singleRead(trig, echo);
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
+
+// MOTOR CONTROL (unchanged)
+void wheel(int IN1, int IN2, int PWM, int spd) {
+  if (spd > 0)      { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  }
+  else if (spd < 0) { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
+  else              { digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);  }
+  analogWrite(PWM, abs(spd));
+}
+void stopMotors() {
+  wheel(FL1,FL2,FL_PWM,0); wheel(FR1,FR2,FR_PWM,0);
+  wheel(BL1,BL2,BL_PWM,0); wheel(BR1,BR2,BR_PWM,0);
+}
+void turnLeft() {
+  wheel(FL1,FL2,FL_PWM,-speed); wheel(FR1,FR2,FR_PWM, speed);
+  wheel(BL1,BL2,BL_PWM,-speed); wheel(BR1,BR2,BR_PWM, speed);
+}
+void turnRight() {
+  wheel(FL1,FL2,FL_PWM, speed); wheel(FR1,FR2,FR_PWM,-speed);
+  wheel(BL1,BL2,BL_PWM, speed); wheel(BR1,BR2,BR_PWM,-speed);
+}
+void followWallSmooth(long dL) {
+  int error      = dL - wallDist;
+  int correction = constrain((int)(Kp * error), -80, 80);
+  int leftSpeed  = constrain(speed - correction, 0, 255);
+  int rightSpeed = constrain(speed + correction, 0, 255);
+  wheel(FL1,FL2,FL_PWM, leftSpeed);  wheel(FR1,FR2,FR_PWM, rightSpeed);
+  wheel(BL1,BL2,BL_PWM, leftSpeed);  wheel(BR1,BR2,BR_PWM, rightSpeed);
+}
+
+// MOVE RECORDING
+void recordMove(byte move) {
+  if (moveCount < MAX_MOVES) {
+    moves[moveCount++] = move;
+  }
+}
+
+// PATH SHORTENING (Step 5 — unchanged)
+void simplifyPath() {
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (int i = 1; i < moveCount - 1; i++) {
+      if (moves[i] == MOVE_U) {
+        byte before = moves[i - 1];
+        byte after  = moves[i + 1];
+        if ((before == MOVE_L && after == MOVE_L) ||
+            (before == MOVE_R && after == MOVE_R)) {
+          for (int j = i - 1; j < moveCount - 3; j++) moves[j] = moves[j + 3];
+          moveCount -= 3;
+          changed = true; break;
+        }
+        if ((before == MOVE_L && after == MOVE_R) ||
+            (before == MOVE_R && after == MOVE_L)) {
+          moves[i - 1] = MOVE_U;
+          for (int j = i; j < moveCount - 2; j++) moves[j] = moves[j + 2];
+          moveCount -= 2;
+          changed = true; break;
+        }
+      }
+    }
+  }
+}
+
+// ── OPTION 2: AUTOMATIC EXIT DETECTION ──────────────────────────────────────
+// Returns true once all 3 sensors have been wide open for EXIT_CONFIRM
+// consecutive readings in a row — filters out false positives at junctions.
+
+bool exitDetected(long dF, long dL, long dR) {
+  if (dF > EXIT_THRESHOLD && dL > EXIT_THRESHOLD && dR > EXIT_THRESHOLD) {
+    openReadings++;
+  } else {
+    openReadings = 0;  // reset if any sensor sees a wall again
+  }
+  return openReadings >= EXIT_CONFIRM;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── OPTION 2: AUTOMATIC COUNTDOWN ───────────────────────────────────────────
+// Robot stops, counts down, then starts speed run automatically.
+// Use this time to pick up and place the robot at the start.
+
+void runCountdown() {
+  Serial.println("EXIT DETECTED! Simplifying path...");
+  simplifyPath();
+
+  Serial.print("Optimised path (");
+  Serial.print(moveCount);
+  Serial.print(" moves): ");
+  for (int i = 0; i < moveCount; i++) {
+    Serial.print(moves[i] == MOVE_L ? "L" : moves[i] == MOVE_R ? "R" : "U");
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  Serial.println("Place robot at START. Speed run begins in...");
+  int seconds = COUNTDOWN_MS / 1000;
+  for (int i = seconds; i > 0; i--) {
+    Serial.println(i);
+    delay(1000);
+  }
+  Serial.println("GO!");
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SPEED RUN
+void driveUntilJunction() {
+  while (true) {
+    long dF = readSensor(trigF, echoF);
+    long dL = readSensor(trigL, echoL);
+    if (dF <= frontMin || dL > wallDist * 2) {
+      stopMotors(); delay(150); return;
+    }
+    followWallSmooth(dL);
+    delay(30);
+  }
+}
+
+void executeSpeedRun() {
+  Serial.println("=== SPEED RUN ===");
+  for (int i = 0; i < moveCount; i++) {
+    driveUntilJunction();
+    switch (moves[i]) {
+      case MOVE_L: turnLeft();  delay(400); stopMotors(); break;
+      case MOVE_R: turnRight(); delay(400); stopMotors(); break;
+      case MOVE_U: turnRight(); delay(800); stopMotors(); break;
+    }
+    delay(100);
+  }
+  driveUntilJunction();
+  stopMotors();
+  Serial.println("=== DONE ===");
+}
+
+// MAIN LOOP
+void loop() {
+  if (mode == DONE) return;
+
+  long dF = readSensor(trigF, echoF);
+  long dL = readSensor(trigL, echoL);
+  long dR = readSensor(trigR, echoR);
+
+  // ── check for exit during exploration ──
+  if (mode == EXPLORE && exitDetected(dF, dL, dR)) {
+    stopMotors();
+    mode = COUNTDOWN;
+    runCountdown();
+    mode = SPEEDRUN;
+    executeSpeedRun();
+    mode = DONE;
+    return;
+  }
+
+  if (mode != EXPLORE) return;
+
+  // decide state
+  State newState;
+  if (dF <= frontMin) {
+    newState = (dL <= wallDist && dR <= wallDist) ? UTURN : AVOID_FRONT;
+  } else if (dL > wallDist * 2) {
+    newState = FIND_WALL;
+  } else {
+    newState = FOLLOW_WALL;
+  }
+
+  // record on state transition
+  if (newState != prevState) {
+    if (newState == FIND_WALL)   recordMove(MOVE_L);
+    if (newState == AVOID_FRONT) recordMove(MOVE_R);
+    if (newState == UTURN)       recordMove(MOVE_U);
+  }
+
+  currentState = newState;
+
+  switch (currentState) {
+    case FOLLOW_WALL:  followWallSmooth(dL);                              break;
+    case FIND_WALL:    turnLeft();  delay(200); stopMotors();             break;
+    case AVOID_FRONT:  stopMotors(); delay(150); turnRight(); delay(400); stopMotors(); break;
+    case UTURN:        stopMotors(); delay(150); turnRight(); delay(800); stopMotors(); break;
+  }
+
+  prevState = currentState;
+  delay(30);
+}
