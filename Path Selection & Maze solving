@@ -1,1 +1,2757 @@
+#include <math.h>
+#include <Servo.h>
+#include <Wire.h>
 
+// Selectable maze solver for an omniwheel robot that keeps the body facing the
+// same way and uses a logical heading for LHR/RHR decisions.
+// A0 selects Left-Hand Rule, A1 selects Right-Hand Rule.
+// Tune the calibration block first: servo signs, thresholds, and pass-wall timing.
+
+enum HandRule : uint8_t {
+  RULE_NONE = 0,
+  RULE_LEFT,
+  RULE_RIGHT
+};
+
+enum BodyDir : uint8_t {
+  BODY_FRONT = 0,
+  BODY_RIGHT,
+  BODY_BACK,
+  BODY_LEFT
+};
+
+enum RobotState : uint8_t {
+  STATE_WAIT_FOR_RULE = 0,
+  STATE_ENTRY_FIND_SIDE_WALLS,
+  STATE_ENTRY_AUTO_ALIGN,
+  STATE_DRIVE,
+  STATE_COMMIT_MOVE,
+  STATE_HEADING_CORRECT,
+  STATE_FASTEST_DONE
+};
+
+enum EntryAlignPhase : uint8_t {
+  ENTRY_ALIGN_SETTLE = 0,
+  ENTRY_ALIGN_NUDGE,
+  ENTRY_ALIGN_FORWARD_NUDGE
+};
+
+struct SensorPins {
+  uint8_t trig;
+  uint8_t echo;
+};
+
+struct DistanceSet {
+  float front;
+  float right;
+  float back;
+  float left;
+};
+
+struct PIDController {
+  float kp;
+  float ki;
+  float kd;
+  float integral;
+  float lastError;
+  unsigned long lastMicros;
+  bool initialized;
+  float integralMin;
+  float integralMax;
+  float outputMin;
+  float outputMax;
+};
+
+// -------------------- Pin map --------------------
+const uint8_t FRONT_TRIG_PIN = 2;
+const uint8_t FRONT_ECHO_PIN = 3;
+const uint8_t RIGHT_TRIG_PIN = 4;
+const uint8_t RIGHT_ECHO_PIN = 5;
+const uint8_t BACK_TRIG_PIN = 6;
+const uint8_t BACK_ECHO_PIN = 7;
+const uint8_t LEFT_TRIG_PIN = 8;
+const uint8_t LEFT_ECHO_PIN = 9;
+
+const uint8_t SERVO_FORWARD_1_PIN = 10;
+const uint8_t SERVO_FORWARD_2_PIN = 11;
+const uint8_t SERVO_SIDE_1_PIN = 12;
+const uint8_t SERVO_SIDE_2_PIN = 13;
+
+const uint8_t BUTTON_LEFT_PIN = A0;
+const uint8_t BUTTON_RIGHT_PIN = A1;
+
+const uint8_t MPU6050_ADDR = 0x68;
+
+// -------------------- Sensor layout --------------------
+const SensorPins FRONT_SENSOR = {FRONT_TRIG_PIN, FRONT_ECHO_PIN};
+// Left/right ultrasonic sensors are intentionally swapped here to match the
+// current wiring on the robot.
+const SensorPins RIGHT_SENSOR = {LEFT_TRIG_PIN, LEFT_ECHO_PIN};
+const SensorPins BACK_SENSOR = {BACK_TRIG_PIN, BACK_ECHO_PIN};
+const SensorPins LEFT_SENSOR = {RIGHT_TRIG_PIN, RIGHT_ECHO_PIN};
+
+// -------------------- Calibration --------------------
+// Continuous rotation servos usually stop near 1500us, but your forward pair
+// needs a slightly different stationary value.
+const int FORWARD_SERVO_NEUTRAL_US = 1515;
+const int SIDE_SERVO_NEUTRAL_US = 1500;
+
+// Main drive speeds.
+const int FORWARD_DRIVE_US = 138;
+const int SIDE_DRIVE_US = 128;
+const int ROTATE_DRIVE_US = 88;
+
+// Mirrored servo directions. Flip the sign if that servo moves the wrong way.
+const int8_t FORWARD_1_MOVE_SIGN = 1;
+const int8_t FORWARD_2_MOVE_SIGN = -1;
+const int8_t SIDE_1_MOVE_SIGN = 1;
+const int8_t SIDE_2_MOVE_SIGN = -1;
+
+// Rotation correction signs. If heading correction turns the wrong way, flip these.
+const int8_t FORWARD_1_ROTATE_SIGN = 1;
+const int8_t FORWARD_2_ROTATE_SIGN = 1;
+const int8_t SIDE_1_ROTATE_SIGN = 1;
+const int8_t SIDE_2_ROTATE_SIGN = 1;
+
+// Flip this if the gyro correction commands are inverted on your robot.
+const int8_t ROTATION_COMMAND_SIGN = 1;
+const int8_t CORNER_ROTATION_COMMAND_SIGN = -1;
+
+// Corridor targets for your 23cm maze.
+const float CENTER_TARGET_CM = 4.0f;
+const float CENTER_MIN_CM = 3.5f;
+const float CENTER_MAX_CM = 4.5f;
+
+// Distance thresholds. Tune these on the real maze.
+const float WALL_PRESENT_CM = 10.0f;
+const float FRONT_BLOCKED_CM = 4.9f;
+const float DIRECTION_OPEN_CM = 11.0f;
+const float NO_ECHO_CM = 80.0f;
+
+const unsigned long MOTOR_SETTLE_MS = 70;
+const unsigned long MIN_DIRECTION_CHANGE_MS = 140;
+const unsigned long MAX_DIRECTION_CHANGE_MS = 980;
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
+const unsigned long SENSOR_REFRESH_MS = 35;
+const unsigned long ENTRY_SIDE_WALL_CONFIRM_MS = 120;
+const unsigned long MAZE_EXIT_CONFIRM_MS = 650;
+const unsigned long MAZE_EXIT_IGNORE_AFTER_START_MS = 1800;
+const float MAZE_EXIT_FRONT_CLEAR_CM = 18.0f;
+const float MAZE_EXIT_SIDE_CLEAR_CM = 14.0f;
+const unsigned long ENTRY_ALIGN_HOLD_MS = 95;
+const unsigned long ENTRY_GYRO_SETTLE_MS = 140;
+const int ENTRY_ALIGN_DRIVE_US = 68;
+const float ENTRY_ALIGN_TOLERANCE_CM = 0.60f;
+const float ENTRY_ALIGN_LONGITUDINAL_TOLERANCE_CM = 0.85f;
+const unsigned long ENTRY_START_ALIGN_HOLD_MS = 45;
+const int ENTRY_START_ALIGN_DRIVE_US = 62;
+const float ENTRY_START_ALIGN_TOLERANCE_CM = 1.25f;
+const float ENTRY_START_ALIGN_LONGITUDINAL_TOLERANCE_CM = 1.80f;
+const unsigned long ENTRY_ALIGN_MEASURE_SETTLE_MS = 180;
+const unsigned long ENTRY_START_ALIGN_MEASURE_SETTLE_MS = 110;
+const unsigned long ENTRY_ALIGN_NUDGE_MIN_MS = 12;
+const unsigned long ENTRY_ALIGN_NUDGE_MAX_MS = 32;
+const unsigned long ENTRY_ALIGN_POST_NUDGE_MS = 110;
+const unsigned long ENTRY_START_ALIGN_NUDGE_MIN_MS = 10;
+const unsigned long ENTRY_START_ALIGN_NUDGE_MAX_MS = 24;
+const unsigned long ENTRY_START_ALIGN_POST_NUDGE_MS = 70;
+const unsigned long STATIONARY_ALIGN_TIMEOUT_MS = 8000;
+const unsigned long AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS = 5000;
+const unsigned long AUTO_ALIGN_FORWARD_NUDGE_MS = 95;
+const int AUTO_ALIGN_FORWARD_NUDGE_US = 66;
+const float AUTO_ALIGN_FORWARD_NUDGE_CLEAR_CM = 8.0f;
+
+// Moving side correction is intentionally very conservative: it only escapes
+// from a close wall instead of constantly chasing perfect center.
+const float CENTER_BALANCE_DEADBAND_CM = 3.0f;
+const float CENTER_SOFT_MARGIN_CM = 1.4f;
+const float CENTERING_FRONT_CLEAR_CM = 13.0f;
+const float DRIVE_CENTER_PID_DEADBAND_CM = 0.85f;
+const float DRIVE_CENTER_CONFIRM_ERROR_CM = 0.90f;
+const unsigned long DRIVE_CENTER_NUDGE_MIN_MS = 14;
+const unsigned long DRIVE_CENTER_NUDGE_MAX_MS = 54;
+const unsigned long CENTERING_COOLDOWN_MS = 120;
+const uint8_t DRIVE_CENTER_CONFIRM_COUNT = 5;
+const int DRIVE_CENTER_MIN_US = 55;
+const int DRIVE_CENTER_MAX_US = 78;
+const int DRIVE_LATERAL_SLEW_US = 1;
+const float SIDE_CORRECTION_MAX_HEADING_ERROR_DEG = 1.0f;
+const float SIDE_CORRECTION_MAX_YAW_RATE_DPS = 2.4f;
+
+// Speed management and wall safety.
+const float FRONT_SLOWDOWN_START_CM = 12.0f;
+const float FRONT_HARD_STOP_CM = 4.5f;
+const float SIDE_MOVING_CORRECTION_START_CM = 3.85f;
+const float SIDE_EMERGENCY_STOP_CM = 3.0f;
+const int FORWARD_MIN_DRIVE_US = 96;
+const int SIDE_MIN_DRIVE_US = 88;
+const int SIDE_SAFETY_RECOVERY_US = 46;
+const int SIDE_SAFETY_ESCAPE_MAX_US = 64;
+const float SIDE_ESCAPE_BALANCE_DEADBAND_CM = 0.55f;
+const float SIDE_CLOSE_BALANCE_DEADBAND_CM = 0.30f;
+const unsigned long SIDE_SAFETY_RECOVERY_MS = 70;
+const unsigned long SIDE_SAFETY_RECOVERY_COOLDOWN_MS = 260;
+const float SIDE_HAND_WALL_MIN_CM = 4.35f;
+const float SIDE_ATTRACTION_START_CM = 5.35f;
+const float SIDE_ATTRACTION_MAX_CM = 9.0f;
+const int SIDE_ATTRACTION_MIN_US = 18;
+const int SIDE_ATTRACTION_MAX_US = 36;
+const unsigned long SIDE_ATTRACTION_MS = 95;
+const unsigned long SIDE_ATTRACTION_COOLDOWN_MS = 320;
+
+// Gyro correction. This keeps the body square with the maze.
+const float GYRO_SENSITIVITY_LSB_PER_DPS = 131.0f;  // MPU6050 at +/-250 dps
+const uint16_t GYRO_CALIBRATION_SAMPLES = 500;
+const float HEADING_TRIM_ERROR_DEG = 4.2f;
+const float HEADING_HARD_ERROR_DEG = 8.0f;
+const float HEADING_DONE_ERROR_DEG = 2.0f;
+const float HEADING_REANCHOR_MAX_ERROR_DEG = 0.6f;
+const float HEADING_STABLE_RATE_DPS = 2.5f;
+const float HEADING_TRIM_MAX_RATE_DPS = 3.0f;
+const float DRIVE_GYRO_PID_START_DEG = 0.45f;
+const float DRIVE_GYRO_PID_MAX_RATE_DPS = 12.0f;
+const int DRIVE_GYRO_PID_MIN_US = 3;
+const int DRIVE_GYRO_PID_MAX_US = 14;
+const int DRIVE_GYRO_SLEW_US = 1;
+const float CORNER_GYRO_PID_TOLERANCE_DEG = 0.8f;
+const int CORNER_GYRO_PID_MIN_US = 20;
+const int CORNER_GYRO_PID_MAX_US = 44;
+const unsigned long CORNER_HEADING_CORRECT_MAX_MS = 360;
+const float HEADING_WALL_GUIDE_DEADBAND_CM = 0.35f;
+const float HEADING_WALL_GUIDE_OVERRIDE_CM = 0.85f;
+const float HEADING_GYRO_PRIORITY_DEG = 1.6f;
+const float SIDE_HEADING_GYRO_ENABLE_DEG = 3.0f;
+const float HEADING_CORRECTION_FRONT_CLEAR_CM = 5.8f;
+const float HEADING_MOVING_TRIM_RESPONSE_DPS = 1.1f;
+const float HEADING_MOVING_TRIM_MIN_PROGRESS_DEG = 0.8f;
+const unsigned long HEADING_MOVING_TRIM_STALL_MS = 180;
+const unsigned long MAX_HEADING_CORRECT_MS = 140;
+const unsigned long HEADING_REANCHOR_HOLD_MS = 180;
+const unsigned long HEADING_CORRECTION_COOLDOWN_MS = 1400;
+const int HEADING_MIN_CORRECT_US = 54;
+const int HEADING_MOVING_TRIM_MIN_US = 16;
+const int HEADING_MOVING_TRIM_MAX_US = 36;
+const bool ENABLE_RUNTIME_GYRO_CORRECTION = true;
+const int8_t WALL_GUIDE_ROTATION_SIGN = 1;
+
+const bool SERIAL_DEBUG = true;
+
+PIDController driveCenterPid = {
+  5.5f, 0.0f, 0.0f,
+  0.0f, 0.0f, 0, false,
+  -5.0f, 5.0f,
+  -24.0f, 24.0f
+};
+
+PIDController driveGyroPid = {
+  1.2f, 0.0f, 0.2f,
+  0.0f, 0.0f, 0, false,
+  0.0f, 8.0f,
+  0.0f, static_cast<float>(DRIVE_GYRO_PID_MAX_US - DRIVE_GYRO_PID_MIN_US)
+};
+
+PIDController cornerGyroPid = {
+  4.2f, 0.08f, 1.1f,
+  0.0f, 0.0f, 0, false,
+  0.0f, 12.0f,
+  0.0f, static_cast<float>(CORNER_GYRO_PID_MAX_US - CORNER_GYRO_PID_MIN_US)
+};
+
+PIDController entryAlignPid = {
+  15.0f, 0.35f, 4.5f,
+  0.0f, 0.0f, 0, false,
+  -4.0f, 4.0f,
+  -44.0f, 44.0f
+};
+
+PIDController frontApproachPid = {
+  8.0f, 0.0f, 1.8f,
+  0.0f, 0.0f, 0, false,
+  0.0f, 12.0f,
+  0.0f, 60.0f
+};
+
+Servo servoForward1;
+Servo servoForward2;
+Servo servoSide1;
+Servo servoSide2;
+
+DistanceSet distances = {NO_ECHO_CM, NO_ECHO_CM, NO_ECHO_CM, NO_ECHO_CM};
+DistanceSet rawDistances = {NO_ECHO_CM, NO_ECHO_CM, NO_ECHO_CM, NO_ECHO_CM};
+
+HandRule selectedRule = RULE_NONE;
+RobotState robotState = STATE_WAIT_FOR_RULE;
+BodyDir logicalHeading = BODY_FRONT;
+BodyDir pendingHeading = BODY_FRONT;
+String path = "";
+String finalPath = "";
+String run1Path = "";
+String run2Path = "";
+String fastestRunPath = "";
+bool run1PathValid = false;
+bool run2PathValid = false;
+bool finalPathValid = false;
+bool pathLearningActive = false;
+bool fastestPathActive = false;
+uint8_t currentLearningRunSlot = 0;
+
+float gyroZBias = 0.0f;
+float gyroRateDps = 0.0f;
+float yawDegrees = 0.0f;
+float headingTargetDegrees = 0.0f;
+float correctionStartErrorDeg = 0.0f;
+unsigned long lastGyroMicros = 0;
+unsigned long lastSensorRefresh = 0;
+unsigned long stateStartedAt = 0;
+unsigned long lastDebugPrint = 0;
+unsigned long mazeSolveStartedAt = 0;
+unsigned long mazeExitSeenSince = 0;
+unsigned long headingStableSince = 0;
+unsigned long headingCorrectionBlockedUntil = 0;
+unsigned long headingTrimStartedAt = 0;
+unsigned long headingTrimLastProgressAt = 0;
+unsigned long centeringUntil = 0;
+unsigned long nextCenteringAllowedAt = 0;
+unsigned long sideEscapeUntil = 0;
+unsigned long sideEscapeCooldownUntil = 0;
+unsigned long activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+BodyDir activeCorrectionDirection = BODY_FRONT;
+int activeCorrectionPowerUs = SIDE_DRIVE_US;
+int activeGyroTrimUs = 0;
+int activeLateralTrimUs = 0;
+int activeSideEscapeTargetUs = 0;
+float filteredSideErrorCm = 0.0f;
+float headingTrimStartErrorDeg = 0.0f;
+float headingTrimBestErrorDeg = 0.0f;
+int8_t sideCorrectionCandidateSign = 0;
+int8_t headingTrimDirectionSign = 0;
+uint8_t sideCorrectionConfirmCount = 0;
+unsigned long sideWallsSeenSince = 0;
+unsigned long entryAlignedSince = 0;
+EntryAlignPhase entryAlignPhase = ENTRY_ALIGN_SETTLE;
+unsigned long entryAlignPhaseUntil = 0;
+int8_t entryAlignDirectionSign = 0;
+BodyDir entryAlignMoveDirection = BODY_FRONT;
+unsigned long nextAutoAlignForwardNudgeAt = 0;
+bool autoAlignResetGyroAfter = false;
+RobotState autoAlignFinishState = STATE_DRIVE;
+BodyDir autoAlignFinishHeading = BODY_FRONT;
+
+float normalizeAngle(float angleDeg) {
+  while (angleDeg > 180.0f) {
+    angleDeg -= 360.0f;
+  }
+  while (angleDeg < -180.0f) {
+    angleDeg += 360.0f;
+  }
+  return angleDeg;
+}
+
+float clampFloat(float value, float lowerBound, float upperBound) {
+  if (value < lowerBound) {
+    return lowerBound;
+  }
+  if (value > upperBound) {
+    return upperBound;
+  }
+  return value;
+}
+
+void resetPid(PIDController &pid) {
+  pid.integral = 0.0f;
+  pid.lastError = 0.0f;
+  pid.lastMicros = 0;
+  pid.initialized = false;
+}
+
+float updatePid(PIDController &pid, float error) {
+  unsigned long nowMicros = micros();
+  float derivative = 0.0f;
+
+  if (!pid.initialized) {
+    pid.initialized = true;
+    pid.lastMicros = nowMicros;
+    pid.lastError = error;
+  } else {
+    float dt = (nowMicros - pid.lastMicros) * 0.000001f;
+    pid.lastMicros = nowMicros;
+
+    if (dt > 0.0f && dt < 0.25f) {
+      pid.integral += error * dt;
+      pid.integral = clampFloat(pid.integral, pid.integralMin, pid.integralMax);
+      derivative = (error - pid.lastError) / dt;
+    }
+    pid.lastError = error;
+  }
+
+  float output = (pid.kp * error) + (pid.ki * pid.integral) + (pid.kd * derivative);
+  return clampFloat(output, pid.outputMin, pid.outputMax);
+}
+
+void resetMotionControllers() {
+  resetPid(driveCenterPid);
+  resetPid(driveGyroPid);
+  resetPid(cornerGyroPid);
+  resetPid(frontApproachPid);
+  activeGyroTrimUs = 0;
+  activeLateralTrimUs = 0;
+  activeSideEscapeTargetUs = 0;
+  sideEscapeUntil = 0;
+  sideEscapeCooldownUntil = 0;
+  activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+}
+
+void resetSideCorrectionConfirmation() {
+  filteredSideErrorCm = 0.0f;
+  sideCorrectionCandidateSign = 0;
+  sideCorrectionConfirmCount = 0;
+}
+
+void resetMazeExitDetection() {
+  mazeExitSeenSince = 0;
+}
+
+int axisBasePowerForDirection(BodyDir dir) {
+  return (dir == BODY_FRONT || dir == BODY_BACK) ? FORWARD_DRIVE_US : SIDE_DRIVE_US;
+}
+
+int axisMinPowerForDirection(BodyDir dir) {
+  return (dir == BODY_FRONT || dir == BODY_BACK) ? FORWARD_MIN_DRIVE_US : SIDE_MIN_DRIVE_US;
+}
+
+int scaleCorrectionPower(float magnitudeMs, int minimumUs, int maximumUs, float maximumMagnitudeMs) {
+  float clampedMagnitude = clampFloat(magnitudeMs, 0.0f, maximumMagnitudeMs);
+  float blend = maximumMagnitudeMs <= 0.0f ? 0.0f : clampedMagnitude / maximumMagnitudeMs;
+  return minimumUs + static_cast<int>((maximumUs - minimumUs) * blend);
+}
+
+int slewSignedUs(int currentUs, int targetUs, int maxStepUs) {
+  if (targetUs > currentUs + maxStepUs) {
+    return currentUs + maxStepUs;
+  }
+  if (targetUs < currentUs - maxStepUs) {
+    return currentUs - maxStepUs;
+  }
+  return targetUs;
+}
+
+BodyDir rotateRight(BodyDir dir) {
+  return static_cast<BodyDir>((dir + 1) % 4);
+}
+
+BodyDir rotateLeft(BodyDir dir) {
+  return static_cast<BodyDir>((dir + 3) % 4);
+}
+
+BodyDir oppositeDir(BodyDir dir) {
+  return static_cast<BodyDir>((dir + 2) % 4);
+}
+
+bool isSideHeading(BodyDir dir) {
+  return dir == BODY_RIGHT || dir == BODY_LEFT;
+}
+
+const char *bodyDirName(BodyDir dir) {
+  switch (dir) {
+    case BODY_FRONT: return "FRONT";
+    case BODY_RIGHT: return "RIGHT";
+    case BODY_BACK: return "BACK";
+    case BODY_LEFT: return "LEFT";
+  }
+  return "?";
+}
+
+const char *ruleName(HandRule rule) {
+  switch (rule) {
+    case RULE_LEFT: return "LHR";
+    case RULE_RIGHT: return "RHR";
+    default: return "NONE";
+  }
+}
+
+float blendDistance(float previousCm, float currentCm) {
+  if (previousCm >= NO_ECHO_CM - 1.0f) {
+    return currentCm;
+  }
+  if (currentCm >= NO_ECHO_CM - 1.0f) {
+    return currentCm;
+  }
+  return (previousCm * 0.55f) + (currentCm * 0.45f);
+}
+
+void writeServoUs(Servo &servo, int valueUs) {
+  servo.writeMicroseconds(constrain(valueUs, 1000, 2000));
+}
+
+void stopAllServos() {
+  writeServoUs(servoForward1, FORWARD_SERVO_NEUTRAL_US);
+  writeServoUs(servoForward2, FORWARD_SERVO_NEUTRAL_US);
+  writeServoUs(servoSide1, SIDE_SERVO_NEUTRAL_US);
+  writeServoUs(servoSide2, SIDE_SERVO_NEUTRAL_US);
+}
+
+void driveForwardAxis(int directionSign, int powerUs) {
+  writeServoUs(servoForward1, FORWARD_SERVO_NEUTRAL_US + (directionSign * FORWARD_1_MOVE_SIGN * powerUs));
+  writeServoUs(servoForward2, FORWARD_SERVO_NEUTRAL_US + (directionSign * FORWARD_2_MOVE_SIGN * powerUs));
+  writeServoUs(servoSide1, SIDE_SERVO_NEUTRAL_US);
+  writeServoUs(servoSide2, SIDE_SERVO_NEUTRAL_US);
+}
+
+void driveSideAxis(int directionSign, int powerUs) {
+  writeServoUs(servoForward1, FORWARD_SERVO_NEUTRAL_US);
+  writeServoUs(servoForward2, FORWARD_SERVO_NEUTRAL_US);
+  writeServoUs(servoSide1, SIDE_SERVO_NEUTRAL_US + (directionSign * SIDE_1_MOVE_SIGN * powerUs));
+  writeServoUs(servoSide2, SIDE_SERVO_NEUTRAL_US + (directionSign * SIDE_2_MOVE_SIGN * powerUs));
+}
+
+void driveRotate(int directionSign, int powerUs) {
+  writeServoUs(servoForward1, FORWARD_SERVO_NEUTRAL_US + (directionSign * FORWARD_1_ROTATE_SIGN * powerUs));
+  writeServoUs(servoForward2, FORWARD_SERVO_NEUTRAL_US + (directionSign * FORWARD_2_ROTATE_SIGN * powerUs));
+  writeServoUs(servoSide1, SIDE_SERVO_NEUTRAL_US + (directionSign * SIDE_1_ROTATE_SIGN * powerUs));
+  writeServoUs(servoSide2, SIDE_SERVO_NEUTRAL_US + (directionSign * SIDE_2_ROTATE_SIGN * powerUs));
+}
+
+void driveBodyComponentsWithRotation(int forwardSignedUs, int sideSignedUs, int rotateSignedUs) {
+  int forward1Us = FORWARD_SERVO_NEUTRAL_US;
+  int forward2Us = FORWARD_SERVO_NEUTRAL_US;
+  int side1Us = SIDE_SERVO_NEUTRAL_US;
+  int side2Us = SIDE_SERVO_NEUTRAL_US;
+
+  forward1Us += FORWARD_1_MOVE_SIGN * forwardSignedUs;
+  forward2Us += FORWARD_2_MOVE_SIGN * forwardSignedUs;
+  side1Us += SIDE_1_MOVE_SIGN * sideSignedUs;
+  side2Us += SIDE_2_MOVE_SIGN * sideSignedUs;
+
+  // Moving yaw correction only trims the axis that is already driving.
+  // This keeps the unused servo pair parked at neutral while still correcting angle.
+  if (rotateSignedUs != 0) {
+    if (abs(forwardSignedUs) >= abs(sideSignedUs) && forwardSignedUs != 0) {
+      forward1Us += FORWARD_1_ROTATE_SIGN * rotateSignedUs;
+      forward2Us += FORWARD_2_ROTATE_SIGN * rotateSignedUs;
+    } else if (sideSignedUs != 0) {
+      side1Us += SIDE_1_ROTATE_SIGN * rotateSignedUs;
+      side2Us += SIDE_2_ROTATE_SIGN * rotateSignedUs;
+    }
+  }
+
+  writeServoUs(servoForward1, forward1Us);
+  writeServoUs(servoForward2, forward2Us);
+  writeServoUs(servoSide1, side1Us);
+  writeServoUs(servoSide2, side2Us);
+}
+
+void relativeMotionToBodyComponents(BodyDir dir, int primarySignedUs, int lateralSignedUs, int &forwardSignedUs, int &sideSignedUs) {
+  forwardSignedUs = 0;
+  sideSignedUs = 0;
+
+  switch (dir) {
+    case BODY_FRONT:
+      forwardSignedUs = primarySignedUs;
+      sideSignedUs = lateralSignedUs;
+      break;
+
+    case BODY_RIGHT:
+      forwardSignedUs = -lateralSignedUs;
+      sideSignedUs = primarySignedUs;
+      break;
+
+    case BODY_BACK:
+      forwardSignedUs = -primarySignedUs;
+      sideSignedUs = -lateralSignedUs;
+      break;
+
+    case BODY_LEFT:
+      forwardSignedUs = lateralSignedUs;
+      sideSignedUs = -primarySignedUs;
+      break;
+  }
+}
+
+void driveRelativeMotionWithCorrections(BodyDir dir, int primaryPowerUs, int lateralSignedUs, int rotateSignedUs) {
+  int forwardSignedUs = 0;
+  int sideSignedUs = 0;
+  relativeMotionToBodyComponents(dir, primaryPowerUs, lateralSignedUs, forwardSignedUs, sideSignedUs);
+  driveBodyComponentsWithRotation(forwardSignedUs, sideSignedUs, rotateSignedUs);
+}
+
+void driveBodyDirectionWithTrim(BodyDir dir, int movePowerUs, int rotateSignedUs) {
+  driveRelativeMotionWithCorrections(dir, movePowerUs, 0, rotateSignedUs);
+}
+
+void driveBodyDirectionWithPower(BodyDir dir, int powerUs) {
+  switch (dir) {
+    case BODY_FRONT:
+      driveForwardAxis(1, powerUs);
+      break;
+    case BODY_BACK:
+      driveForwardAxis(-1, powerUs);
+      break;
+    case BODY_RIGHT:
+      driveSideAxis(1, powerUs);
+      break;
+    case BODY_LEFT:
+      driveSideAxis(-1, powerUs);
+      break;
+  }
+}
+
+void driveBodyDirection(BodyDir dir) {
+  driveBodyDirectionWithPower(dir, axisBasePowerForDirection(dir));
+}
+
+void softStop() {
+  stopAllServos();
+  delay(MOTOR_SETTLE_MS);
+}
+
+void writeMpuByte(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+int16_t readMpuWord(uint8_t reg) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, static_cast<uint8_t>(2));
+  if (Wire.available() < 2) {
+    return 0;
+  }
+  int16_t highByte = Wire.read();
+  int16_t lowByte = Wire.read();
+  return static_cast<int16_t>((highByte << 8) | lowByte);
+}
+
+void initMpu6050() {
+  Wire.begin();
+  writeMpuByte(0x6B, 0x00);  // Wake up
+  writeMpuByte(0x1B, 0x00);  // Gyro +/-250 dps
+  writeMpuByte(0x1A, 0x03);  // Mild low-pass filter
+  delay(100);
+}
+
+void calibrateGyro() {
+  long accumulator = 0;
+  for (uint16_t i = 0; i < GYRO_CALIBRATION_SAMPLES; ++i) {
+    accumulator += readMpuWord(0x47);
+    delay(3);
+  }
+  gyroZBias = accumulator / static_cast<float>(GYRO_CALIBRATION_SAMPLES);
+  gyroRateDps = 0.0f;
+  yawDegrees = 0.0f;
+  headingTargetDegrees = 0.0f;
+  correctionStartErrorDeg = 0.0f;
+  headingStableSince = 0;
+  headingCorrectionBlockedUntil = 0;
+  lastGyroMicros = micros();
+}
+
+void resetHeadingAfterAlignment() {
+  stopAllServos();
+  delay(ENTRY_GYRO_SETTLE_MS);
+  calibrateGyro();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetPid(entryAlignPid);
+  headingTargetDegrees = yawDegrees;
+  headingCorrectionBlockedUntil = millis() + HEADING_CORRECTION_COOLDOWN_MS;
+}
+
+void updateGyro() {
+  unsigned long nowMicros = micros();
+  if (lastGyroMicros == 0) {
+    lastGyroMicros = nowMicros;
+    return;
+  }
+
+  float dt = (nowMicros - lastGyroMicros) * 0.000001f;
+  lastGyroMicros = nowMicros;
+  if (dt <= 0.0f || dt > 0.2f) {
+    return;
+  }
+
+  int16_t rawGz = readMpuWord(0x47);
+  gyroRateDps = (rawGz - gyroZBias) / GYRO_SENSITIVITY_LSB_PER_DPS;
+  yawDegrees = normalizeAngle(yawDegrees + (gyroRateDps * dt));
+}
+
+float readDistanceCm(const SensorPins &pins) {
+  digitalWrite(pins.trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(pins.trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(pins.trig, LOW);
+
+  unsigned long durationUs = pulseIn(pins.echo, HIGH, 9000);
+  if (durationUs == 0) {
+    return NO_ECHO_CM;
+  }
+
+  float distanceCm = durationUs * 0.0343f * 0.5f;
+  if (distanceCm > NO_ECHO_CM) {
+    return NO_ECHO_CM;
+  }
+  return distanceCm;
+}
+
+void refreshSensorsIfNeeded() {
+  unsigned long now = millis();
+  if (now - lastSensorRefresh < SENSOR_REFRESH_MS) {
+    return;
+  }
+  lastSensorRefresh = now;
+
+  rawDistances.front = readDistanceCm(FRONT_SENSOR);
+  distances.front = blendDistance(distances.front, rawDistances.front);
+  delay(6);
+  rawDistances.right = readDistanceCm(RIGHT_SENSOR);
+  distances.right = blendDistance(distances.right, rawDistances.right);
+  delay(6);
+  rawDistances.back = readDistanceCm(BACK_SENSOR);
+  distances.back = blendDistance(distances.back, rawDistances.back);
+  delay(6);
+  rawDistances.left = readDistanceCm(LEFT_SENSOR);
+  distances.left = blendDistance(distances.left, rawDistances.left);
+}
+
+float distanceForBodyDir(BodyDir dir) {
+  switch (dir) {
+    case BODY_FRONT: return distances.front;
+    case BODY_RIGHT: return distances.right;
+    case BODY_BACK: return distances.back;
+    case BODY_LEFT: return distances.left;
+  }
+  return NO_ECHO_CM;
+}
+
+float rawDistanceForBodyDir(BodyDir dir) {
+  switch (dir) {
+    case BODY_FRONT: return rawDistances.front;
+    case BODY_RIGHT: return rawDistances.right;
+    case BODY_BACK: return rawDistances.back;
+    case BODY_LEFT: return rawDistances.left;
+  }
+  return NO_ECHO_CM;
+}
+
+float relativeForwardDistance() {
+  return distanceForBodyDir(logicalHeading);
+}
+
+float relativeRightDistance() {
+  return distanceForBodyDir(rotateRight(logicalHeading));
+}
+
+float relativeLeftDistance() {
+  return distanceForBodyDir(rotateLeft(logicalHeading));
+}
+
+float relativeBackDistance() {
+  return distanceForBodyDir(oppositeDir(logicalHeading));
+}
+
+float relativeForwardRawDistance() {
+  return rawDistanceForBodyDir(logicalHeading);
+}
+
+float relativeRightRawDistance() {
+  return rawDistanceForBodyDir(rotateRight(logicalHeading));
+}
+
+float relativeLeftRawDistance() {
+  return rawDistanceForBodyDir(rotateLeft(logicalHeading));
+}
+
+float relativeBackRawDistance() {
+  return rawDistanceForBodyDir(oppositeDir(logicalHeading));
+}
+
+float minValidDistance(float blendedCm, float rawCm) {
+  return rawCm < blendedCm ? rawCm : blendedCm;
+}
+
+float maxValidDistance(float blendedCm, float rawCm) {
+  return rawCm > blendedCm ? rawCm : blendedCm;
+}
+
+float relativeForwardSafetyDistance() {
+  return minValidDistance(relativeForwardDistance(), relativeForwardRawDistance());
+}
+
+float relativeRightSafetyDistance() {
+  return minValidDistance(relativeRightDistance(), relativeRightRawDistance());
+}
+
+float relativeLeftSafetyDistance() {
+  return minValidDistance(relativeLeftDistance(), relativeLeftRawDistance());
+}
+
+float relativeBackSafetyDistance() {
+  return minValidDistance(relativeBackDistance(), relativeBackRawDistance());
+}
+
+float relativeForwardDecisionDistance() {
+  return maxValidDistance(relativeForwardDistance(), relativeForwardRawDistance());
+}
+
+float relativeRightDecisionDistance() {
+  return maxValidDistance(relativeRightDistance(), relativeRightRawDistance());
+}
+
+float relativeLeftDecisionDistance() {
+  return maxValidDistance(relativeLeftDistance(), relativeLeftRawDistance());
+}
+
+float sideBalanceErrorCm() {
+  if (!isWallPresent(relativeLeftDistance()) || !isWallPresent(relativeRightDistance())) {
+    return 0.0f;
+  }
+  return relativeRightDistance() - relativeLeftDistance();
+}
+
+int8_t signWithDeadband(float value, float deadband) {
+  if (value > deadband) {
+    return 1;
+  }
+  if (value < -deadband) {
+    return -1;
+  }
+  return 0;
+}
+
+bool sideCorrectionAllowedByHeading() {
+  float headingError = fabs(normalizeAngle(headingTargetDegrees - yawDegrees));
+  return headingError < SIDE_CORRECTION_MAX_HEADING_ERROR_DEG && fabs(gyroRateDps) < SIDE_CORRECTION_MAX_YAW_RATE_DPS;
+}
+
+bool getConfirmedSideCorrectionError(float &confirmedErrorCm) {
+  if (!isWallPresent(relativeLeftDistance()) || !isWallPresent(relativeRightDistance())) {
+    resetSideCorrectionConfirmation();
+    confirmedErrorCm = 0.0f;
+    return false;
+  }
+
+  float rawErrorCm = sideBalanceErrorCm();
+  if (sideCorrectionConfirmCount == 0) {
+    filteredSideErrorCm = rawErrorCm;
+  } else {
+    filteredSideErrorCm = (filteredSideErrorCm * 0.65f) + (rawErrorCm * 0.35f);
+  }
+
+  int8_t errorSign = signWithDeadband(filteredSideErrorCm, DRIVE_CENTER_CONFIRM_ERROR_CM);
+  if (errorSign == 0) {
+    resetSideCorrectionConfirmation();
+    confirmedErrorCm = 0.0f;
+    return false;
+  }
+
+  if (errorSign == sideCorrectionCandidateSign) {
+    if (sideCorrectionConfirmCount < DRIVE_CENTER_CONFIRM_COUNT) {
+      sideCorrectionConfirmCount++;
+    }
+  } else {
+    sideCorrectionCandidateSign = errorSign;
+    sideCorrectionConfirmCount = 1;
+  }
+
+  confirmedErrorCm = filteredSideErrorCm;
+  return sideCorrectionConfirmCount >= DRIVE_CENTER_CONFIRM_COUNT;
+}
+
+bool isWallPresent(float distanceCm) {
+  return distanceCm < WALL_PRESENT_CM;
+}
+
+bool isFrontBlocked(float distanceCm) {
+  return distanceCm <= FRONT_BLOCKED_CM;
+}
+
+bool isDirectionOpen(float distanceCm) {
+  return distanceCm >= DIRECTION_OPEN_CM;
+}
+
+bool inCenterBand(float distanceCm) {
+  return distanceCm >= CENTER_MIN_CM && distanceCm <= CENTER_MAX_CM;
+}
+
+BodyDir correctionDirectionForError(float sideErrorCm) {
+  return sideErrorCm >= 0.0f ? rotateRight(logicalHeading) : rotateLeft(logicalHeading);
+}
+
+void clearActiveCorrection() {
+  centeringUntil = 0;
+  activeCorrectionDirection = logicalHeading;
+  activeCorrectionPowerUs = SIDE_DRIVE_US;
+  activeGyroTrimUs = 0;
+  activeLateralTrimUs = 0;
+  activeSideEscapeTargetUs = 0;
+  sideEscapeUntil = 0;
+  sideEscapeCooldownUntil = 0;
+  activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+}
+
+void resetHeadingTrimProgress() {
+  headingTrimStartedAt = 0;
+  headingTrimLastProgressAt = 0;
+  headingTrimStartErrorDeg = 0.0f;
+  headingTrimBestErrorDeg = 0.0f;
+  headingTrimDirectionSign = 0;
+}
+
+void startActiveCorrection(BodyDir dir, int powerUs, unsigned long durationMs, unsigned long cooldownMs) {
+  unsigned long now = millis();
+  activeCorrectionDirection = dir;
+  activeCorrectionPowerUs = powerUs;
+  centeringUntil = now + durationMs;
+  nextCenteringAllowedAt = now + durationMs + cooldownMs;
+}
+
+int computeApproachDrivePower(BodyDir dir, float forwardDistanceCm) {
+  int basePower = axisBasePowerForDirection(dir);
+  int minimumPower = axisMinPowerForDirection(dir);
+
+  if (forwardDistanceCm >= FRONT_SLOWDOWN_START_CM || forwardDistanceCm >= NO_ECHO_CM - 1.0f) {
+    resetPid(frontApproachPid);
+    return basePower;
+  }
+
+  float distanceError = forwardDistanceCm - FRONT_BLOCKED_CM;
+  if (distanceError < 0.0f) {
+    distanceError = 0.0f;
+  }
+
+  if (basePower <= minimumPower) {
+    return basePower;
+  }
+
+  float pidOutput = updatePid(frontApproachPid, distanceError);
+  return constrain(minimumPower + static_cast<int>(pidOutput), minimumPower, basePower);
+}
+
+int computeMovingHeadingTrimPower(float absErrorDeg) {
+  if (absErrorDeg <= HEADING_TRIM_ERROR_DEG) {
+    return 0;
+  }
+
+  float span = HEADING_HARD_ERROR_DEG - HEADING_TRIM_ERROR_DEG;
+  float blend = span <= 0.0f ? 1.0f : (absErrorDeg - HEADING_TRIM_ERROR_DEG) / span;
+  blend = clampFloat(blend, 0.0f, 1.0f);
+  return HEADING_MOVING_TRIM_MIN_US + static_cast<int>((HEADING_MOVING_TRIM_MAX_US - HEADING_MOVING_TRIM_MIN_US) * blend);
+}
+
+bool handleSideWallEmergency() {
+  float leftCm = relativeLeftSafetyDistance();
+  float rightCm = relativeRightSafetyDistance();
+  bool leftTooClose = isWallPresent(leftCm) && leftCm <= SIDE_EMERGENCY_STOP_CM;
+  bool rightTooClose = isWallPresent(rightCm) && rightCm <= SIDE_EMERGENCY_STOP_CM;
+
+  if (!leftTooClose && !rightTooClose) {
+    return false;
+  }
+
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+
+  beginSafetyAutoAlign();
+  return true;
+}
+
+int computeSideSafetyEscapeLateralSignedUs() {
+  float leftCm = relativeLeftSafetyDistance();
+  float rightCm = relativeRightSafetyDistance();
+  bool leftNearWall = isWallPresent(leftCm) && leftCm <= SIDE_MOVING_CORRECTION_START_CM;
+  bool rightNearWall = isWallPresent(rightCm) && rightCm <= SIDE_MOVING_CORRECTION_START_CM;
+
+  if (!leftNearWall && !rightNearWall) {
+    return 0;
+  }
+
+  if (leftNearWall && rightNearWall && fabs(leftCm - rightCm) <= SIDE_ESCAPE_BALANCE_DEADBAND_CM) {
+    return 0;
+  }
+
+  float correctionSpanCm = SIDE_MOVING_CORRECTION_START_CM - SIDE_EMERGENCY_STOP_CM;
+  if (correctionSpanCm <= 0.0f) {
+    correctionSpanCm = 0.5f;
+  }
+
+  float leftSeverity = leftNearWall ? (SIDE_MOVING_CORRECTION_START_CM - leftCm) : 0.0f;
+  float rightSeverity = rightNearWall ? (SIDE_MOVING_CORRECTION_START_CM - rightCm) : 0.0f;
+
+  if (leftSeverity >= rightSeverity) {
+    int escapeUs = scaleCorrectionPower(
+      leftSeverity,
+      SIDE_SAFETY_RECOVERY_US,
+      SIDE_SAFETY_ESCAPE_MAX_US,
+      correctionSpanCm
+    );
+    return escapeUs;
+  }
+
+  int escapeUs = scaleCorrectionPower(
+    rightSeverity,
+    SIDE_SAFETY_RECOVERY_US,
+    SIDE_SAFETY_ESCAPE_MAX_US,
+    correctionSpanCm
+  );
+  return -escapeUs;
+}
+
+int computeHandWallAttractionLateralSignedUs() {
+  if (selectedRule == RULE_NONE) {
+    return 0;
+  }
+
+  bool followingRightWall = selectedRule == RULE_RIGHT;
+  float handWallCm = followingRightWall ? relativeRightSafetyDistance() : relativeLeftSafetyDistance();
+  float oppositeWallCm = followingRightWall ? relativeLeftSafetyDistance() : relativeRightSafetyDistance();
+  bool oppositeWallPresent = isWallPresent(oppositeWallCm);
+
+  if (!isWallPresent(handWallCm)) {
+    return 0;
+  }
+
+  if (handWallCm < SIDE_HAND_WALL_MIN_CM) {
+    bool closelyBalancedInNarrowCorridor =
+      oppositeWallPresent &&
+      handWallCm >= CENTER_MIN_CM &&
+      fabs(handWallCm - oppositeWallCm) <= SIDE_CLOSE_BALANCE_DEADBAND_CM;
+
+    if (closelyBalancedInNarrowCorridor) {
+      return 0;
+    }
+
+    float closeSpanCm = SIDE_HAND_WALL_MIN_CM - SIDE_EMERGENCY_STOP_CM;
+    if (closeSpanCm <= 0.0f) {
+      closeSpanCm = 0.5f;
+    }
+
+    int awayUs = scaleCorrectionPower(
+      SIDE_HAND_WALL_MIN_CM - handWallCm,
+      SIDE_ATTRACTION_MIN_US,
+      SIDE_ATTRACTION_MAX_US,
+      closeSpanCm
+    );
+    return followingRightWall ? -awayUs : awayUs;
+  }
+
+  if (oppositeWallPresent &&
+      fabs(handWallCm - oppositeWallCm) <= SIDE_ESCAPE_BALANCE_DEADBAND_CM) {
+    return 0;
+  }
+
+  if (handWallCm <= SIDE_ATTRACTION_START_CM) {
+    return 0;
+  }
+
+  float attractionSpanCm = SIDE_ATTRACTION_MAX_CM - SIDE_ATTRACTION_START_CM;
+  if (attractionSpanCm <= 0.0f) {
+    attractionSpanCm = 1.0f;
+  }
+
+  float attractionSeverityCm = handWallCm - SIDE_ATTRACTION_START_CM;
+  int attractionUs = scaleCorrectionPower(
+    attractionSeverityCm,
+    SIDE_ATTRACTION_MIN_US,
+    SIDE_ATTRACTION_MAX_US,
+    attractionSpanCm
+  );
+
+  return followingRightWall ? attractionUs : -attractionUs;
+}
+
+bool runDriveCenteringIfNeeded(float forwardCm) {
+  unsigned long now = millis();
+  activeGyroTrimUs = 0;
+
+  if (centeringUntil != 0 && now < centeringUntil) {
+    driveBodyDirectionWithPower(activeCorrectionDirection, activeCorrectionPowerUs);
+    return true;
+  }
+
+  clearActiveCorrection();
+
+  if (now < nextCenteringAllowedAt) {
+    return false;
+  }
+
+  if (forwardCm <= CENTERING_FRONT_CLEAR_CM) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    return false;
+  }
+
+  if (!sideCorrectionAllowedByHeading()) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    return false;
+  }
+
+  if (!needsCentering()) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    return false;
+  }
+
+  float confirmedErrorCm = 0.0f;
+  if (!getConfirmedSideCorrectionError(confirmedErrorCm)) {
+    return false;
+  }
+
+  float pidOutputMs = updatePid(driveCenterPid, confirmedErrorCm);
+  unsigned long nudgeMs = static_cast<unsigned long>(
+    clampFloat(
+      fabs(pidOutputMs),
+      static_cast<float>(DRIVE_CENTER_NUDGE_MIN_MS),
+      static_cast<float>(DRIVE_CENTER_NUDGE_MAX_MS)
+    )
+  );
+  int correctionPowerUs = scaleCorrectionPower(
+    fabs(pidOutputMs),
+    DRIVE_CENTER_MIN_US,
+    DRIVE_CENTER_MAX_US,
+    driveCenterPid.outputMax
+  );
+
+  startActiveCorrection(
+    correctionDirectionForError(confirmedErrorCm),
+    correctionPowerUs,
+    nudgeMs,
+    CENTERING_COOLDOWN_MS
+  );
+  driveBodyDirectionWithPower(activeCorrectionDirection, activeCorrectionPowerUs);
+  return true;
+}
+
+int computeDriveCenterPidLateralSignedUs(float forwardCm) {
+  activeCorrectionPowerUs = 0;
+
+  if (forwardCm <= CENTERING_FRONT_CLEAR_CM) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = 0;
+    return 0;
+  }
+
+  if (!sideCorrectionAllowedByHeading()) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = 0;
+    return 0;
+  }
+
+  if (!needsCentering()) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = 0;
+    return 0;
+  }
+
+  float confirmedErrorCm = 0.0f;
+  if (!getConfirmedSideCorrectionError(confirmedErrorCm)) {
+    activeLateralTrimUs = 0;
+    return 0;
+  }
+
+  if (fabs(confirmedErrorCm) <= DRIVE_CENTER_PID_DEADBAND_CM) {
+    resetPid(driveCenterPid);
+    activeLateralTrimUs = slewSignedUs(activeLateralTrimUs, 0, DRIVE_LATERAL_SLEW_US);
+    activeCorrectionPowerUs = abs(activeLateralTrimUs);
+    return activeLateralTrimUs;
+  }
+
+  float correctionErrorCm = confirmedErrorCm;
+  if (correctionErrorCm > 0.0f) {
+    correctionErrorCm -= DRIVE_CENTER_PID_DEADBAND_CM;
+  } else {
+    correctionErrorCm += DRIVE_CENTER_PID_DEADBAND_CM;
+  }
+
+  int lateralTrimTargetUs = static_cast<int>(updatePid(driveCenterPid, correctionErrorCm));
+  lateralTrimTargetUs = constrain(lateralTrimTargetUs, -DRIVE_CENTER_MAX_US, DRIVE_CENTER_MAX_US);
+  int lateralTrimUs = slewSignedUs(activeLateralTrimUs, lateralTrimTargetUs, DRIVE_LATERAL_SLEW_US);
+  activeLateralTrimUs = lateralTrimUs;
+  lateralTrimUs = constrain(lateralTrimUs, -DRIVE_CENTER_MAX_US, DRIVE_CENTER_MAX_US);
+  activeCorrectionPowerUs = abs(lateralTrimUs);
+  activeCorrectionDirection = correctionDirectionForError(confirmedErrorCm);
+  return lateralTrimUs;
+}
+
+int computeDriveLateralSignedUs(float forwardCm) {
+  unsigned long now = millis();
+
+  if (fastestPathActive) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = 0;
+    activeSideEscapeTargetUs = 0;
+    sideEscapeUntil = 0;
+    activeCorrectionPowerUs = 0;
+    (void)forwardCm;
+    return 0;
+  }
+
+  if (isSideHeading(logicalHeading)) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = 0;
+    activeSideEscapeTargetUs = 0;
+    sideEscapeUntil = 0;
+    activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+    activeCorrectionPowerUs = 0;
+    return 0;
+  }
+
+  int safetyTrimUs = computeSideSafetyEscapeLateralSignedUs();
+  int attractionTrimUs = computeHandWallAttractionLateralSignedUs();
+  if (sideEscapeUntil != 0 && now < sideEscapeUntil) {
+    resetPid(driveCenterPid);
+    resetSideCorrectionConfirmation();
+    activeLateralTrimUs = slewSignedUs(activeLateralTrimUs, activeSideEscapeTargetUs, DRIVE_LATERAL_SLEW_US);
+    activeCorrectionPowerUs = abs(activeLateralTrimUs);
+    activeCorrectionDirection = activeLateralTrimUs > 0 ? rotateRight(logicalHeading) : rotateLeft(logicalHeading);
+    (void)forwardCm;
+    return activeLateralTrimUs;
+  }
+
+  if (sideEscapeUntil != 0) {
+    sideEscapeUntil = 0;
+    sideEscapeCooldownUntil = now + activeSideAdjustCooldownMs;
+    activeSideEscapeTargetUs = 0;
+    activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+  }
+
+  if (safetyTrimUs != 0 && now >= sideEscapeCooldownUntil) {
+    sideEscapeUntil = now + SIDE_SAFETY_RECOVERY_MS;
+    activeSideEscapeTargetUs = safetyTrimUs;
+    activeSideAdjustCooldownMs = SIDE_SAFETY_RECOVERY_COOLDOWN_MS;
+  } else if (attractionTrimUs != 0 && now >= sideEscapeCooldownUntil) {
+    sideEscapeUntil = now + SIDE_ATTRACTION_MS;
+    activeSideEscapeTargetUs = attractionTrimUs;
+    activeSideAdjustCooldownMs = SIDE_ATTRACTION_COOLDOWN_MS;
+  }
+
+  resetPid(driveCenterPid);
+  resetSideCorrectionConfirmation();
+  activeLateralTrimUs = slewSignedUs(activeLateralTrimUs, 0, DRIVE_LATERAL_SLEW_US);
+  activeCorrectionPowerUs = abs(activeLateralTrimUs);
+  (void)forwardCm;
+  return activeLateralTrimUs;
+}
+
+int computeDriveRotateTrimSignedUsForHeading(BodyDir dir) {
+  (void)dir;
+  return computeDriveGyroPidTrimSignedUs();
+}
+
+bool bothSideWallsVisible() {
+  return isWallPresent(relativeLeftDistance()) && isWallPresent(relativeRightDistance());
+}
+
+bool frontBackWallsVisible() {
+  return isWallPresent(relativeForwardDistance()) && isWallPresent(relativeBackDistance());
+}
+
+bool rawSideWallsVisible() {
+  return isWallPresent(relativeLeftSafetyDistance()) && isWallPresent(relativeRightSafetyDistance());
+}
+
+bool isSquareInCorridor() {
+  if (!bothSideWallsVisible()) {
+    return false;
+  }
+
+  float leftCm = relativeLeftDistance();
+  float rightCm = relativeRightDistance();
+  return inCenterBand(leftCm) && inCenterBand(rightCm) && fabs(leftCm - rightCm) <= CENTER_BALANCE_DEADBAND_CM;
+}
+
+bool needsCentering() {
+  if (!bothSideWallsVisible()) {
+    return false;
+  }
+
+  float leftCm = relativeLeftDistance();
+  float rightCm = relativeRightDistance();
+  bool leftOutsideSoftBand = leftCm < (CENTER_MIN_CM - CENTER_SOFT_MARGIN_CM) || leftCm > (CENTER_MAX_CM + CENTER_SOFT_MARGIN_CM);
+  bool rightOutsideSoftBand = rightCm < (CENTER_MIN_CM - CENTER_SOFT_MARGIN_CM) || rightCm > (CENTER_MAX_CM + CENTER_SOFT_MARGIN_CM);
+  return leftOutsideSoftBand || rightOutsideSoftBand || fabs(leftCm - rightCm) > CENTER_BALANCE_DEADBAND_CM;
+}
+
+bool entryAlignCentered() {
+  if (!bothSideWallsVisible()) {
+    return false;
+  }
+
+  float leftCm = relativeLeftDistance();
+  float rightCm = relativeRightDistance();
+  return fabs(leftCm - rightCm) <= ENTRY_ALIGN_TOLERANCE_CM;
+}
+
+bool wallAlignPossible() {
+  return isWallPresent(relativeLeftDistance()) || isWallPresent(relativeRightDistance());
+}
+
+bool positionAlignPossible() {
+  return wallAlignPossible() || frontBackWallsVisible();
+}
+
+float wallAlignErrorCm() {
+  bool leftWall = isWallPresent(relativeLeftDistance());
+  bool rightWall = isWallPresent(relativeRightDistance());
+
+  if (leftWall && rightWall) {
+    return relativeRightDistance() - relativeLeftDistance();
+  }
+
+  if (leftWall) {
+    return CENTER_TARGET_CM - relativeLeftDistance();
+  }
+
+  if (rightWall) {
+    return relativeRightDistance() - CENTER_TARGET_CM;
+  }
+
+  return 0.0f;
+}
+
+float frontBackAlignErrorCm() {
+  if (!frontBackWallsVisible()) {
+    return 0.0f;
+  }
+
+  return relativeBackDistance() - relativeForwardDistance();
+}
+
+bool wallAlignCentered() {
+  bool leftWall = isWallPresent(relativeLeftDistance());
+  bool rightWall = isWallPresent(relativeRightDistance());
+
+  if (leftWall && rightWall) {
+    float leftCm = relativeLeftDistance();
+    float rightCm = relativeRightDistance();
+    bool balancedBetweenWalls = fabs(rightCm - leftCm) <= ENTRY_ALIGN_TOLERANCE_CM;
+
+    if (balancedBetweenWalls && leftCm > SIDE_EMERGENCY_STOP_CM && rightCm > SIDE_EMERGENCY_STOP_CM) {
+      return true;
+    }
+
+    return inCenterBand(leftCm) &&
+           inCenterBand(rightCm) &&
+           balancedBetweenWalls;
+  }
+
+  if (leftWall) {
+    return fabs(CENTER_TARGET_CM - relativeLeftDistance()) <= ENTRY_ALIGN_TOLERANCE_CM;
+  }
+
+  if (rightWall) {
+    return fabs(relativeRightDistance() - CENTER_TARGET_CM) <= ENTRY_ALIGN_TOLERANCE_CM;
+  }
+
+  return false;
+}
+
+float currentEntryLongitudinalToleranceCm() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_LONGITUDINAL_TOLERANCE_CM : ENTRY_ALIGN_LONGITUDINAL_TOLERANCE_CM;
+}
+
+bool longitudinalAlignCentered() {
+  if (!frontBackWallsVisible()) {
+    return true;
+  }
+
+  return fabs(frontBackAlignErrorCm()) <= currentEntryLongitudinalToleranceCm();
+}
+
+unsigned long currentEntryAlignHoldMs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_HOLD_MS : ENTRY_ALIGN_HOLD_MS;
+}
+
+unsigned long currentEntryAlignMeasureSettleMs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_MEASURE_SETTLE_MS : ENTRY_ALIGN_MEASURE_SETTLE_MS;
+}
+
+int currentEntryAlignDriveUs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_DRIVE_US : ENTRY_ALIGN_DRIVE_US;
+}
+
+unsigned long currentEntryAlignNudgeMinMs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_NUDGE_MIN_MS : ENTRY_ALIGN_NUDGE_MIN_MS;
+}
+
+unsigned long currentEntryAlignNudgeMaxMs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_NUDGE_MAX_MS : ENTRY_ALIGN_NUDGE_MAX_MS;
+}
+
+unsigned long currentEntryAlignPostNudgeMs() {
+  return autoAlignResetGyroAfter ? ENTRY_START_ALIGN_POST_NUDGE_MS : ENTRY_ALIGN_POST_NUDGE_MS;
+}
+
+BodyDir dominantEntryAlignDirection(float &dominantErrorCm) {
+  if (autoAlignResetGyroAfter && wallAlignPossible()) {
+    dominantErrorCm = currentEntryAlignErrorCm();
+    return dominantErrorCm >= 0.0f ? rotateRight(logicalHeading) : rotateLeft(logicalHeading);
+  }
+
+  float lateralErrorCm = wallAlignPossible() ? currentEntryAlignErrorCm() : 0.0f;
+  float longitudinalErrorCm = frontBackWallsVisible() ? frontBackAlignErrorCm() : 0.0f;
+
+  if (frontBackWallsVisible() && (!wallAlignPossible() || fabs(longitudinalErrorCm) > fabs(lateralErrorCm))) {
+    dominantErrorCm = longitudinalErrorCm;
+    return longitudinalErrorCm >= 0.0f ? oppositeDir(logicalHeading) : logicalHeading;
+  }
+
+  dominantErrorCm = lateralErrorCm;
+  return lateralErrorCm >= 0.0f ? rotateRight(logicalHeading) : rotateLeft(logicalHeading);
+}
+
+float currentEntryAlignErrorCm() {
+  if (autoAlignResetGyroAfter && bothSideWallsVisible()) {
+    return relativeRightDistance() - relativeLeftDistance();
+  }
+
+  return wallAlignErrorCm();
+}
+
+bool currentEntryAlignCentered() {
+  bool lateralCentered = true;
+  if (autoAlignResetGyroAfter && bothSideWallsVisible()) {
+    lateralCentered = fabs(relativeRightDistance() - relativeLeftDistance()) <= ENTRY_START_ALIGN_TOLERANCE_CM;
+  } else {
+    lateralCentered = wallAlignCentered();
+  }
+
+  if (autoAlignResetGyroAfter) {
+    return lateralCentered;
+  }
+
+  return lateralCentered && longitudinalAlignCentered();
+}
+
+int wallGuidedRotationSign(float &wallErrorCm) {
+  wallErrorCm = 0.0f;
+
+  if (bothSideWallsVisible()) {
+    float confirmedErrorCm = 0.0f;
+    if (!getConfirmedSideCorrectionError(confirmedErrorCm)) {
+      return 0;
+    }
+
+    wallErrorCm = confirmedErrorCm;
+    return signWithDeadband(confirmedErrorCm, HEADING_WALL_GUIDE_DEADBAND_CM) * WALL_GUIDE_ROTATION_SIGN;
+  }
+
+  if (!wallAlignPossible()) {
+    return 0;
+  }
+
+  wallErrorCm = wallAlignErrorCm();
+  return signWithDeadband(wallErrorCm, HEADING_WALL_GUIDE_DEADBAND_CM) * WALL_GUIDE_ROTATION_SIGN;
+}
+
+int runtimeHeadingCorrectionSign(float headingErrorDeg, float &wallErrorCm) {
+  int gyroSign = headingErrorDeg >= 0.0f ? 1 : -1;
+  int guidedSign = wallGuidedRotationSign(wallErrorCm);
+
+  if (guidedSign == 0) {
+    return gyroSign;
+  }
+
+  if (guidedSign == gyroSign) {
+    return gyroSign;
+  }
+
+  if (fabs(headingErrorDeg) >= HEADING_GYRO_PRIORITY_DEG) {
+    return gyroSign;
+  }
+
+  if (fabs(wallErrorCm) >= HEADING_WALL_GUIDE_OVERRIDE_CM) {
+    return guidedSign;
+  }
+
+  return gyroSign;
+}
+
+int computeDriveGyroPidTrimSignedUs() {
+  if (!ENABLE_RUNTIME_GYRO_CORRECTION) {
+    activeGyroTrimUs = 0;
+    resetPid(driveGyroPid);
+    return 0;
+  }
+
+  if (headingCorrectionBlockedUntil > millis()) {
+    activeGyroTrimUs = 0;
+    resetPid(driveGyroPid);
+    return 0;
+  }
+
+  if (relativeForwardSafetyDistance() <= HEADING_CORRECTION_FRONT_CLEAR_CM) {
+    activeGyroTrimUs = 0;
+    resetPid(driveGyroPid);
+    return 0;
+  }
+
+  float headingErrorDeg = normalizeAngle(headingTargetDegrees - yawDegrees);
+  float absHeadingErrorDeg = fabs(headingErrorDeg);
+  if (absHeadingErrorDeg < DRIVE_GYRO_PID_START_DEG || fabs(gyroRateDps) > DRIVE_GYRO_PID_MAX_RATE_DPS) {
+    activeGyroTrimUs = slewSignedUs(activeGyroTrimUs, 0, DRIVE_GYRO_SLEW_US);
+    resetPid(driveGyroPid);
+    return activeGyroTrimUs;
+  }
+
+  float wallErrorCm = 0.0f;
+  int correctionSign = runtimeHeadingCorrectionSign(headingErrorDeg, wallErrorCm);
+  if (correctionSign == 0) {
+    activeGyroTrimUs = slewSignedUs(activeGyroTrimUs, 0, DRIVE_GYRO_SLEW_US);
+    resetPid(driveGyroPid);
+    return activeGyroTrimUs;
+  }
+
+  float pidOutputUs = updatePid(driveGyroPid, absHeadingErrorDeg);
+  int trimUs = constrain(
+    DRIVE_GYRO_PID_MIN_US + static_cast<int>(pidOutputUs),
+    DRIVE_GYRO_PID_MIN_US,
+    DRIVE_GYRO_PID_MAX_US
+  );
+  int targetTrimUs = correctionSign * trimUs * ROTATION_COMMAND_SIGN;
+  activeGyroTrimUs = slewSignedUs(activeGyroTrimUs, targetTrimUs, DRIVE_GYRO_SLEW_US);
+  return activeGyroTrimUs;
+}
+
+bool runCornerGyroPidIfNeeded() {
+  activeGyroTrimUs = 0;
+
+  if (!ENABLE_RUNTIME_GYRO_CORRECTION) {
+    resetPid(cornerGyroPid);
+    return false;
+  }
+
+  if (autoAlignResetGyroAfter) {
+    resetPid(cornerGyroPid);
+    return false;
+  }
+
+  float headingErrorDeg = normalizeAngle(headingTargetDegrees - yawDegrees);
+  float absHeadingErrorDeg = fabs(headingErrorDeg);
+  if (absHeadingErrorDeg <= CORNER_GYRO_PID_TOLERANCE_DEG) {
+    resetPid(cornerGyroPid);
+    return false;
+  }
+
+  float pidOutputUs = updatePid(cornerGyroPid, absHeadingErrorDeg);
+  int rotateUs = constrain(
+    CORNER_GYRO_PID_MIN_US + static_cast<int>(pidOutputUs),
+    CORNER_GYRO_PID_MIN_US,
+    CORNER_GYRO_PID_MAX_US
+  );
+  int rotateSign = headingErrorDeg > 0.0f ? 1 : -1;
+  activeGyroTrimUs = rotateSign * rotateUs * CORNER_ROTATION_COMMAND_SIGN;
+  driveRotate(activeGyroTrimUs > 0 ? 1 : -1, rotateUs);
+  return true;
+}
+
+int computeSignedMovingHeadingTrim(float &wallErrorCm) {
+  activeCorrectionPowerUs = 0;
+
+  if (!ENABLE_RUNTIME_GYRO_CORRECTION) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  unsigned long now = millis();
+  if (now < headingCorrectionBlockedUntil) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  if (relativeForwardSafetyDistance() <= HEADING_CORRECTION_FRONT_CLEAR_CM) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  float headingErrorDeg = normalizeAngle(headingTargetDegrees - yawDegrees);
+  float absErrorDeg = fabs(headingErrorDeg);
+
+  if (absErrorDeg < HEADING_TRIM_ERROR_DEG) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  if (absErrorDeg < HEADING_HARD_ERROR_DEG && fabs(gyroRateDps) > HEADING_TRIM_MAX_RATE_DPS) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  int correctionSign = runtimeHeadingCorrectionSign(headingErrorDeg, wallErrorCm);
+  if (correctionSign == 0) {
+    resetHeadingTrimProgress();
+    return 0;
+  }
+
+  if (headingTrimDirectionSign != correctionSign || headingTrimStartedAt == 0) {
+    headingTrimDirectionSign = correctionSign;
+    headingTrimStartedAt = now;
+    headingTrimLastProgressAt = now;
+    headingTrimStartErrorDeg = absErrorDeg;
+    headingTrimBestErrorDeg = absErrorDeg;
+  } else if (absErrorDeg <= (headingTrimBestErrorDeg - HEADING_MOVING_TRIM_MIN_PROGRESS_DEG)) {
+    headingTrimBestErrorDeg = absErrorDeg;
+    headingTrimLastProgressAt = now;
+  } else if (absErrorDeg < headingTrimBestErrorDeg) {
+    headingTrimBestErrorDeg = absErrorDeg;
+  }
+
+  bool noTurningResponse = fabs(gyroRateDps) < HEADING_MOVING_TRIM_RESPONSE_DPS;
+  bool noUsefulProgress = headingTrimBestErrorDeg > (headingTrimStartErrorDeg - HEADING_MOVING_TRIM_MIN_PROGRESS_DEG);
+  if ((now - headingTrimStartedAt >= HEADING_MOVING_TRIM_STALL_MS) &&
+      noTurningResponse &&
+      noUsefulProgress) {
+    headingCorrectionBlockedUntil = now + HEADING_CORRECTION_COOLDOWN_MS;
+    resetHeadingTrimProgress();
+
+    if (SERIAL_DEBUG) {
+      Serial.println(F("Moving trim abandoned. Continuing until next corner."));
+    }
+    return 0;
+  }
+
+  int trimPowerUs = computeMovingHeadingTrimPower(absErrorDeg);
+  activeCorrectionPowerUs = trimPowerUs;
+  return correctionSign * trimPowerUs * ROTATION_COMMAND_SIGN;
+}
+
+BodyDir chooseNextHeading() {
+  float rightCm = relativeRightDecisionDistance();
+  float forwardCm = relativeForwardDecisionDistance();
+  float leftCm = relativeLeftDecisionDistance();
+
+  if (selectedRule == RULE_RIGHT) {
+    if (isDirectionOpen(rightCm)) {
+      return rotateRight(logicalHeading);
+    }
+    if (isDirectionOpen(forwardCm)) {
+      return logicalHeading;
+    }
+    if (isDirectionOpen(leftCm)) {
+      return rotateLeft(logicalHeading);
+    }
+    return oppositeDir(logicalHeading);
+  }
+
+  if (isDirectionOpen(leftCm)) {
+    return rotateLeft(logicalHeading);
+  }
+  if (isDirectionOpen(forwardCm)) {
+    return logicalHeading;
+  }
+  if (isDirectionOpen(rightCm)) {
+    return rotateRight(logicalHeading);
+  }
+  return oppositeDir(logicalHeading);
+}
+
+bool isPathMoveValid(char move) {
+  return move == 'L' || move == 'R' || move == 'S' || move == 'B';
+}
+
+char pathMoveForHeading(BodyDir fromHeading, BodyDir toHeading) {
+  if (toHeading == rotateLeft(fromHeading)) {
+    return 'L';
+  }
+  if (toHeading == rotateRight(fromHeading)) {
+    return 'R';
+  }
+  if (toHeading == fromHeading) {
+    return 'S';
+  }
+  return 'B';
+}
+
+BodyDir headingForPathMove(BodyDir fromHeading, char move) {
+  switch (move) {
+    case 'L':
+      return rotateLeft(fromHeading);
+    case 'R':
+      return rotateRight(fromHeading);
+    case 'S':
+      return fromHeading;
+    case 'B':
+      return oppositeDir(fromHeading);
+  }
+  return fromHeading;
+}
+
+void simplifyPath() {
+  bool changed = true;
+
+  while (changed && path.length() >= 3) {
+    changed = false;
+    int startIndex = path.length() - 3;
+    char firstMove = path[startIndex];
+    char middleMove = path[startIndex + 1];
+    char lastMove = path[startIndex + 2];
+    char replacementMove = '\0';
+
+    if (middleMove != 'B') {
+      return;
+    }
+
+    if (firstMove == 'L' && lastMove == 'R') {
+      replacementMove = 'B';
+    } else if (firstMove == 'R' && lastMove == 'L') {
+      replacementMove = 'B';
+    } else if (firstMove == 'S' && lastMove == 'S') {
+      replacementMove = 'B';
+    } else if (firstMove == 'L' && lastMove == 'S') {
+      replacementMove = 'R';
+    } else if (firstMove == 'S' && lastMove == 'L') {
+      replacementMove = 'R';
+    } else if (firstMove == 'R' && lastMove == 'S') {
+      replacementMove = 'L';
+    } else if (firstMove == 'S' && lastMove == 'R') {
+      replacementMove = 'L';
+    }
+
+    if (replacementMove == '\0') {
+      return;
+    }
+
+    path.remove(startIndex);
+    path += replacementMove;
+    changed = true;
+  }
+}
+
+uint8_t openDecisionDirectionCount() {
+  uint8_t openCount = 0;
+
+  if (isDirectionOpen(relativeLeftDecisionDistance())) {
+    ++openCount;
+  }
+  if (isDirectionOpen(relativeForwardDecisionDistance())) {
+    ++openCount;
+  }
+  if (isDirectionOpen(relativeRightDecisionDistance())) {
+    ++openCount;
+  }
+
+  return openCount;
+}
+
+bool shouldRecordPathDecision(char move) {
+  if (move == 'B') {
+    return true;
+  }
+
+  if (openDecisionDirectionCount() >= 2) {
+    return true;
+  }
+
+  // Corners have one open path plus the route behind us. Record them so Run 3
+  // can replay the full route without relying on wall-following decisions.
+  return isFrontBlocked(relativeForwardDecisionDistance());
+}
+
+uint8_t nextLearningRunSlot() {
+  if (!run1PathValid) {
+    return 1;
+  }
+  if (!run2PathValid) {
+    return 2;
+  }
+  return run1Path.length() >= run2Path.length() ? 1 : 2;
+}
+
+void updateFinalPathFromStoredRuns() {
+  if (run1PathValid && (!run2PathValid || run1Path.length() <= run2Path.length())) {
+    finalPath = run1Path;
+    finalPathValid = true;
+    return;
+  }
+
+  if (run2PathValid) {
+    finalPath = run2Path;
+    finalPathValid = true;
+    return;
+  }
+
+  finalPath = "";
+  finalPathValid = false;
+}
+
+void saveCurrentLearningRunPath() {
+  if (!pathLearningActive) {
+    return;
+  }
+
+  simplifyPath();
+
+  if (currentLearningRunSlot == 0) {
+    currentLearningRunSlot = nextLearningRunSlot();
+  }
+
+  if (currentLearningRunSlot == 1) {
+    run1Path = path;
+    run1PathValid = true;
+  } else {
+    run2Path = path;
+    run2PathValid = true;
+  }
+
+  updateFinalPathFromStoredRuns();
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Run "));
+    Serial.print(currentLearningRunSlot);
+    Serial.print(F(" saved: "));
+    Serial.println(path);
+    Serial.print(F("Shortest saved path: "));
+    Serial.println(finalPath);
+  }
+
+  currentLearningRunSlot = 0;
+}
+
+void recordPathDecision(BodyDir fromHeading, BodyDir toHeading) {
+  if (!pathLearningActive || fastestPathActive) {
+    return;
+  }
+
+  char move = pathMoveForHeading(fromHeading, toHeading);
+  if (!shouldRecordPathDecision(move)) {
+    return;
+  }
+
+  path += move;
+  simplifyPath();
+  if (!finalPathValid) {
+    finalPath = path;
+  }
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Path learned: "));
+    Serial.print(path);
+    Serial.print(F("  Final candidate: "));
+    Serial.println(finalPath);
+  }
+}
+
+void finishFastestRoute() {
+  stopAllServos();
+  clearActiveCorrection();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  fastestPathActive = false;
+  pathLearningActive = false;
+  fastestRunPath = "";
+  currentLearningRunSlot = 0;
+  selectedRule = RULE_NONE;
+  robotState = STATE_FASTEST_DONE;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Fastest route complete. Robot stopped."));
+  }
+}
+
+bool mazeExitDistanceClear(float blendedCm, float rawCm, float thresholdCm) {
+  return blendedCm >= thresholdCm && rawCm >= thresholdCm;
+}
+
+bool mazeExitCandidateVisible() {
+  if (mazeSolveStartedAt == 0) {
+    return false;
+  }
+
+  if (millis() - mazeSolveStartedAt < MAZE_EXIT_IGNORE_AFTER_START_MS) {
+    return false;
+  }
+
+  bool frontClear = mazeExitDistanceClear(
+    relativeForwardDistance(),
+    relativeForwardRawDistance(),
+    MAZE_EXIT_FRONT_CLEAR_CM
+  );
+  bool leftClear = mazeExitDistanceClear(
+    relativeLeftDistance(),
+    relativeLeftRawDistance(),
+    MAZE_EXIT_SIDE_CLEAR_CM
+  );
+  bool rightClear = mazeExitDistanceClear(
+    relativeRightDistance(),
+    relativeRightRawDistance(),
+    MAZE_EXIT_SIDE_CLEAR_CM
+  );
+
+  return frontClear && leftClear && rightClear;
+}
+
+void finishMazeRun() {
+  stopAllServos();
+  clearActiveCorrection();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+
+  saveCurrentLearningRunPath();
+
+  fastestPathActive = false;
+  pathLearningActive = false;
+  fastestRunPath = "";
+  currentLearningRunSlot = 0;
+  selectedRule = RULE_NONE;
+  robotState = STATE_FASTEST_DONE;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Maze exit detected. Robot stopped."));
+    Serial.print(F("Shortest path saved: "));
+    Serial.println(finalPath);
+  }
+}
+
+bool handleMazeExitIfDetected() {
+  if (robotState != STATE_DRIVE && robotState != STATE_COMMIT_MOVE) {
+    resetMazeExitDetection();
+    return false;
+  }
+
+  if (!mazeExitCandidateVisible()) {
+    resetMazeExitDetection();
+    return false;
+  }
+
+  unsigned long now = millis();
+  if (mazeExitSeenSince == 0) {
+    mazeExitSeenSince = now;
+    return false;
+  }
+
+  if (now - mazeExitSeenSince >= MAZE_EXIT_CONFIRM_MS) {
+    finishMazeRun();
+    return true;
+  }
+
+  return false;
+}
+
+bool selectFastestPathHeading(BodyDir &nextHeading) {
+  while (fastestRunPath.length() > 0) {
+    char move = fastestRunPath[0];
+    fastestRunPath.remove(0, 1);
+
+    if (!isPathMoveValid(move)) {
+      continue;
+    }
+
+    nextHeading = headingForPathMove(logicalHeading, move);
+
+    if (SERIAL_DEBUG) {
+      Serial.print(F("Fastest move: "));
+      Serial.print(move);
+      Serial.print(F(" -> "));
+      Serial.println(bodyDirName(nextHeading));
+    }
+    return true;
+  }
+
+  finishFastestRoute();
+  return false;
+}
+
+bool selectNextHeadingForDecision(BodyDir &nextHeading) {
+  if (fastestPathActive) {
+    return selectFastestPathHeading(nextHeading);
+  }
+
+  BodyDir fromHeading = logicalHeading;
+  nextHeading = chooseNextHeading();
+  recordPathDecision(fromHeading, nextHeading);
+  return true;
+}
+
+bool corridorReadyForNewHeading() {
+  float leftCm = relativeLeftDistance();
+  float rightCm = relativeRightDistance();
+  bool leftWall = isWallPresent(leftCm);
+  bool rightWall = isWallPresent(rightCm);
+  float softMin = CENTER_MIN_CM - CENTER_SOFT_MARGIN_CM;
+  float softMax = CENTER_MAX_CM + CENTER_SOFT_MARGIN_CM;
+
+  bool leftReady = leftCm >= softMin && leftCm <= softMax;
+  bool rightReady = rightCm >= softMin && rightCm <= softMax;
+
+  if (leftWall && rightWall) {
+    return leftReady && rightReady;
+  }
+
+  if (selectedRule == RULE_RIGHT && rightWall) {
+    return rightReady;
+  }
+
+  if (selectedRule == RULE_LEFT && leftWall) {
+    return leftReady;
+  }
+
+  if (leftWall) {
+    return leftReady;
+  }
+
+  if (rightWall) {
+    return rightReady;
+  }
+
+  return false;
+}
+
+void maybeReanchorHeading() {
+  if (robotState != STATE_DRIVE) {
+    headingStableSince = 0;
+    return;
+  }
+
+  float headingErrorDeg = fabs(normalizeAngle(headingTargetDegrees - yawDegrees));
+  if (!isSquareInCorridor() ||
+      isFrontBlocked(relativeForwardDistance()) ||
+      fabs(gyroRateDps) > HEADING_STABLE_RATE_DPS ||
+      headingErrorDeg > HEADING_REANCHOR_MAX_ERROR_DEG) {
+    headingStableSince = 0;
+    return;
+  }
+
+  if (headingStableSince == 0) {
+    headingStableSince = millis();
+    return;
+  }
+
+  if (millis() - headingStableSince >= HEADING_REANCHOR_HOLD_MS) {
+    headingTargetDegrees = yawDegrees;
+  }
+}
+
+void beginDirectionChange(BodyDir newHeading) {
+  pendingHeading = newHeading;
+  headingStableSince = 0;
+  clearActiveCorrection();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  softStop();
+  logicalHeading = pendingHeading;
+  stateStartedAt = millis();
+  robotState = STATE_COMMIT_MOVE;
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Heading change -> "));
+    Serial.println(bodyDirName(logicalHeading));
+  }
+}
+
+void beginCornerHeadingCorrect() {
+  if (!selectNextHeadingForDecision(pendingHeading)) {
+    return;
+  }
+  headingStableSince = 0;
+  clearActiveCorrection();
+  resetHeadingTrimProgress();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  resetPid(cornerGyroPid);
+  stopAllServos();
+  stateStartedAt = millis();
+  robotState = STATE_HEADING_CORRECT;
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Corner angle correct before moving "));
+    Serial.println(bodyDirName(pendingHeading));
+  }
+}
+
+void beginEntryAutoAlign() {
+  autoAlignResetGyroAfter = true;
+  autoAlignFinishState = STATE_DRIVE;
+  autoAlignFinishHeading = BODY_FRONT;
+  stopAllServos();
+  robotState = STATE_ENTRY_AUTO_ALIGN;
+  stateStartedAt = millis();
+  nextAutoAlignForwardNudgeAt = stateStartedAt + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+  entryAlignedSince = 0;
+  clearActiveCorrection();
+  resetHeadingTrimProgress();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  resetPid(entryAlignPid);
+  entryAlignPhase = ENTRY_ALIGN_SETTLE;
+  entryAlignPhaseUntil = millis() + currentEntryAlignMeasureSettleMs();
+  entryAlignDirectionSign = 0;
+  entryAlignMoveDirection = logicalHeading;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Entry corridor found. Starting slow auto-align."));
+  }
+}
+
+void beginCornerAutoAlign() {
+  pendingHeading = logicalHeading;
+  autoAlignResetGyroAfter = false;
+  autoAlignFinishState = STATE_COMMIT_MOVE;
+  autoAlignFinishHeading = logicalHeading;
+  stopAllServos();
+  robotState = STATE_ENTRY_AUTO_ALIGN;
+  stateStartedAt = millis();
+  nextAutoAlignForwardNudgeAt = stateStartedAt + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+  entryAlignedSince = 0;
+  clearActiveCorrection();
+  resetHeadingTrimProgress();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  resetPid(entryAlignPid);
+  entryAlignPhase = ENTRY_ALIGN_SETTLE;
+  entryAlignPhaseUntil = millis() + ENTRY_ALIGN_MEASURE_SETTLE_MS;
+  entryAlignDirectionSign = 0;
+  entryAlignMoveDirection = logicalHeading;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Corner/dead end reached. Stopping to align before moving."));
+  }
+}
+
+void beginSafetyAutoAlign() {
+  pendingHeading = logicalHeading;
+  autoAlignResetGyroAfter = false;
+  autoAlignFinishState = STATE_DRIVE;
+  autoAlignFinishHeading = logicalHeading;
+  stopAllServos();
+  robotState = STATE_ENTRY_AUTO_ALIGN;
+  stateStartedAt = millis();
+  nextAutoAlignForwardNudgeAt = stateStartedAt + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+  entryAlignedSince = 0;
+  clearActiveCorrection();
+  resetHeadingTrimProgress();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetMazeExitDetection();
+  resetPid(entryAlignPid);
+  entryAlignPhase = ENTRY_ALIGN_SETTLE;
+  entryAlignPhaseUntil = millis() + ENTRY_ALIGN_MEASURE_SETTLE_MS;
+  entryAlignDirectionSign = 0;
+  entryAlignMoveDirection = logicalHeading;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Side wall close. Stopping for slow re-align."));
+  }
+}
+
+void beginMazeSolveAfterEntry() {
+  softStop();
+  resetHeadingAfterAlignment();
+  logicalHeading = BODY_FRONT;
+  pendingHeading = BODY_FRONT;
+  headingStableSince = 0;
+  correctionStartErrorDeg = 0.0f;
+  clearActiveCorrection();
+  resetHeadingTrimProgress();
+  nextCenteringAllowedAt = millis() + CENTERING_COOLDOWN_MS;
+  resetSideCorrectionConfirmation();
+  sideWallsSeenSince = 0;
+  entryAlignedSince = 0;
+  entryAlignPhase = ENTRY_ALIGN_SETTLE;
+  entryAlignPhaseUntil = 0;
+  entryAlignDirectionSign = 0;
+  entryAlignMoveDirection = logicalHeading;
+  nextAutoAlignForwardNudgeAt = 0;
+  mazeSolveStartedAt = millis();
+  resetMazeExitDetection();
+  stateStartedAt = millis();
+  robotState = STATE_DRIVE;
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Entry alignment complete. Gyro reset. Starting maze solve."));
+  }
+}
+
+void finishAutoAlign() {
+  softStop();
+  clearActiveCorrection();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetHeadingTrimProgress();
+  resetMazeExitDetection();
+  headingTargetDegrees = yawDegrees;
+  logicalHeading = autoAlignFinishHeading;
+  nextAutoAlignForwardNudgeAt = 0;
+  stateStartedAt = millis();
+  robotState = autoAlignFinishState;
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Alignment complete. Moving "));
+    Serial.println(bodyDirName(logicalHeading));
+  }
+}
+
+void continueAfterAutoAlignTimeout() {
+  bool frontBlocked = isFrontBlocked(relativeForwardSafetyDistance());
+
+  if (autoAlignResetGyroAfter) {
+    autoAlignFinishState = frontBlocked ? STATE_COMMIT_MOVE : STATE_DRIVE;
+    if (frontBlocked) {
+      if (!selectNextHeadingForDecision(autoAlignFinishHeading)) {
+        return;
+      }
+    } else {
+      autoAlignFinishHeading = BODY_FRONT;
+    }
+  } else if (autoAlignFinishState == STATE_COMMIT_MOVE) {
+    if (!selectNextHeadingForDecision(autoAlignFinishHeading)) {
+      return;
+    }
+  }
+
+  if (autoAlignResetGyroAfter) {
+    mazeSolveStartedAt = millis();
+    resetMazeExitDetection();
+  }
+
+  softStop();
+  clearActiveCorrection();
+  resetMotionControllers();
+  resetSideCorrectionConfirmation();
+  resetHeadingTrimProgress();
+  resetPid(entryAlignPid);
+  entryAlignedSince = 0;
+  entryAlignPhase = ENTRY_ALIGN_SETTLE;
+  entryAlignPhaseUntil = 0;
+  entryAlignDirectionSign = 0;
+  entryAlignMoveDirection = autoAlignFinishHeading;
+  nextAutoAlignForwardNudgeAt = 0;
+  headingStableSince = 0;
+  correctionStartErrorDeg = 0.0f;
+  sideWallsSeenSince = 0;
+  logicalHeading = autoAlignFinishHeading;
+  pendingHeading = logicalHeading;
+  stateStartedAt = millis();
+  robotState = autoAlignFinishState;
+
+  if (SERIAL_DEBUG) {
+    Serial.print(F("Auto-align timeout. Continuing "));
+    Serial.print(bodyDirName(logicalHeading));
+    Serial.println(F(" and correcting while moving."));
+  }
+}
+
+void maybeSelectRule() {
+  static unsigned long leftPressedAt = 0;
+  static unsigned long rightPressedAt = 0;
+  static unsigned long bothPressedAt = 0;
+
+  bool leftPressed = digitalRead(BUTTON_LEFT_PIN) == LOW;
+  bool rightPressed = digitalRead(BUTTON_RIGHT_PIN) == LOW;
+  bool bothPressed = leftPressed && rightPressed;
+  unsigned long now = millis();
+
+  if (bothPressed) {
+    leftPressedAt = 0;
+    rightPressedAt = 0;
+
+    if (bothPressedAt == 0) {
+      bothPressedAt = now;
+    }
+
+    if (now - bothPressedAt >= BUTTON_DEBOUNCE_MS) {
+      updateFinalPathFromStoredRuns();
+
+      if (finalPathValid) {
+        fastestRunPath = finalPath;
+        selectedRule = RULE_RIGHT;
+        fastestPathActive = true;
+        pathLearningActive = false;
+        currentLearningRunSlot = 0;
+      } else if (SERIAL_DEBUG) {
+        Serial.println(F("No completed run path yet. Finish Run 1/Run 2 first."));
+      }
+    }
+    if (selectedRule == RULE_NONE) {
+      return;
+    }
+  } else {
+    bothPressedAt = 0;
+
+    if (leftPressed) {
+      if (leftPressedAt == 0) {
+        leftPressedAt = now;
+      }
+      if (now - leftPressedAt >= BUTTON_DEBOUNCE_MS) {
+        selectedRule = RULE_LEFT;
+        fastestPathActive = false;
+        pathLearningActive = true;
+        fastestRunPath = "";
+        currentLearningRunSlot = nextLearningRunSlot();
+        path = "";
+      }
+    } else {
+      leftPressedAt = 0;
+    }
+
+    if (rightPressed) {
+      if (rightPressedAt == 0) {
+        rightPressedAt = now;
+      }
+      if (now - rightPressedAt >= BUTTON_DEBOUNCE_MS) {
+        selectedRule = RULE_RIGHT;
+        fastestPathActive = false;
+        pathLearningActive = true;
+        fastestRunPath = "";
+        currentLearningRunSlot = nextLearningRunSlot();
+        path = "";
+      }
+    } else {
+      rightPressedAt = 0;
+    }
+  }
+
+  if (selectedRule != RULE_NONE) {
+    logicalHeading = BODY_FRONT;
+    pendingHeading = BODY_FRONT;
+    robotState = STATE_ENTRY_FIND_SIDE_WALLS;
+    headingTargetDegrees = yawDegrees;
+    headingStableSince = 0;
+    headingCorrectionBlockedUntil = 0;
+    correctionStartErrorDeg = 0.0f;
+    clearActiveCorrection();
+    resetHeadingTrimProgress();
+    resetMotionControllers();
+    resetSideCorrectionConfirmation();
+    resetPid(entryAlignPid);
+    nextCenteringAllowedAt = 0;
+    mazeSolveStartedAt = 0;
+    resetMazeExitDetection();
+    sideWallsSeenSince = 0;
+    entryAlignedSince = 0;
+    entryAlignPhase = ENTRY_ALIGN_SETTLE;
+    entryAlignPhaseUntil = 0;
+    entryAlignDirectionSign = 0;
+    entryAlignMoveDirection = logicalHeading;
+    nextAutoAlignForwardNudgeAt = 0;
+    stateStartedAt = now;
+    softStop();
+
+    if (SERIAL_DEBUG) {
+      if (fastestPathActive) {
+        Serial.print(F("Run 3 selected. Fastest route: "));
+        Serial.println(finalPath);
+      } else {
+        Serial.print(F("Rule selected: "));
+        Serial.println(ruleName(selectedRule));
+      }
+    }
+  }
+}
+
+int computeHeadingCorrectionPower(float absErrorDeg) {
+  if (absErrorDeg <= HEADING_DONE_ERROR_DEG) {
+    return HEADING_MIN_CORRECT_US;
+  }
+
+  float span = HEADING_HARD_ERROR_DEG - HEADING_DONE_ERROR_DEG;
+  float blend = span <= 0.0f ? 1.0f : (absErrorDeg - HEADING_DONE_ERROR_DEG) / span;
+  blend = clampFloat(blend, 0.0f, 1.0f);
+  return HEADING_MIN_CORRECT_US + static_cast<int>((ROTATE_DRIVE_US - HEADING_MIN_CORRECT_US) * blend);
+}
+
+void runHeadingCorrection() {
+  unsigned long elapsed = millis() - stateStartedAt;
+  float headingErrorDeg = normalizeAngle(headingTargetDegrees - yawDegrees);
+
+  if (fabs(headingErrorDeg) <= CORNER_GYRO_PID_TOLERANCE_DEG ||
+      elapsed >= CORNER_HEADING_CORRECT_MAX_MS) {
+    stopAllServos();
+    resetPid(cornerGyroPid);
+    activeGyroTrimUs = 0;
+    beginDirectionChange(pendingHeading);
+    return;
+  }
+
+  if (!runCornerGyroPidIfNeeded()) {
+    beginDirectionChange(pendingHeading);
+  }
+}
+
+void runEntryFindSideWallsState() {
+  float forwardCm = relativeForwardSafetyDistance();
+
+  if (forwardCm <= FRONT_HARD_STOP_CM) {
+    stopAllServos();
+    if (rawSideWallsVisible()) {
+      beginEntryAutoAlign();
+    }
+    return;
+  }
+
+  if (rawSideWallsVisible()) {
+    if (sideWallsSeenSince == 0) {
+      sideWallsSeenSince = millis();
+    }
+
+    if (millis() - sideWallsSeenSince >= ENTRY_SIDE_WALL_CONFIRM_MS) {
+      beginEntryAutoAlign();
+      return;
+    }
+  } else {
+    sideWallsSeenSince = 0;
+  }
+
+  driveForwardAxis(1, computeApproachDrivePower(BODY_FRONT, forwardCm));
+}
+
+void runEntryAutoAlignState() {
+  unsigned long now = millis();
+  int alignDriveUs = currentEntryAlignDriveUs();
+  stopAllServos();
+
+  if (nextAutoAlignForwardNudgeAt == 0) {
+    nextAutoAlignForwardNudgeAt = now + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+  }
+
+  if ((autoAlignResetGyroAfter || autoAlignFinishState == STATE_COMMIT_MOVE) &&
+      (now - stateStartedAt >= STATIONARY_ALIGN_TIMEOUT_MS)) {
+    continueAfterAutoAlignTimeout();
+    return;
+  }
+
+  if (entryAlignPhase == ENTRY_ALIGN_FORWARD_NUDGE) {
+    if (now < entryAlignPhaseUntil &&
+        relativeForwardSafetyDistance() > AUTO_ALIGN_FORWARD_NUDGE_CLEAR_CM) {
+      driveBodyDirectionWithPower(logicalHeading, AUTO_ALIGN_FORWARD_NUDGE_US);
+      return;
+    }
+
+    stopAllServos();
+    entryAlignPhase = ENTRY_ALIGN_SETTLE;
+    entryAlignPhaseUntil = now + currentEntryAlignMeasureSettleMs();
+    entryAlignDirectionSign = 0;
+    entryAlignMoveDirection = logicalHeading;
+    nextAutoAlignForwardNudgeAt = now + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+    return;
+  }
+
+  if (now >= nextAutoAlignForwardNudgeAt) {
+    if (relativeForwardSafetyDistance() > AUTO_ALIGN_FORWARD_NUDGE_CLEAR_CM) {
+      entryAlignedSince = 0;
+      resetPid(entryAlignPid);
+      entryAlignPhase = ENTRY_ALIGN_FORWARD_NUDGE;
+      entryAlignPhaseUntil = now + AUTO_ALIGN_FORWARD_NUDGE_MS;
+      entryAlignDirectionSign = 0;
+      entryAlignMoveDirection = logicalHeading;
+      driveBodyDirectionWithPower(logicalHeading, AUTO_ALIGN_FORWARD_NUDGE_US);
+
+      if (SERIAL_DEBUG) {
+        Serial.println(F("Auto-align taking a small forward nudge."));
+      }
+      return;
+    }
+
+    nextAutoAlignForwardNudgeAt = now + AUTO_ALIGN_FORWARD_NUDGE_INTERVAL_MS;
+  }
+
+  if (!positionAlignPossible()) {
+    if (!autoAlignResetGyroAfter &&
+        autoAlignFinishState == STATE_COMMIT_MOVE &&
+        isFrontBlocked(relativeForwardSafetyDistance())) {
+      if (!selectNextHeadingForDecision(autoAlignFinishHeading)) {
+        return;
+      }
+
+      if (SERIAL_DEBUG) {
+        Serial.print(F("Junction has no opposite walls to align against. Following rule -> "));
+        Serial.println(bodyDirName(autoAlignFinishHeading));
+      }
+
+      finishAutoAlign();
+      return;
+    }
+
+    entryAlignedSince = 0;
+    resetPid(entryAlignPid);
+    entryAlignPhase = ENTRY_ALIGN_SETTLE;
+    entryAlignPhaseUntil = now + currentEntryAlignMeasureSettleMs();
+    entryAlignDirectionSign = 0;
+    entryAlignMoveDirection = logicalHeading;
+    return;
+  }
+
+  if (entryAlignPhase == ENTRY_ALIGN_NUDGE) {
+    if (now < entryAlignPhaseUntil) {
+      driveBodyDirectionWithPower(entryAlignMoveDirection, alignDriveUs);
+      return;
+    }
+
+    stopAllServos();
+    entryAlignPhase = ENTRY_ALIGN_SETTLE;
+    entryAlignPhaseUntil = now + currentEntryAlignPostNudgeMs();
+    entryAlignDirectionSign = 0;
+    entryAlignMoveDirection = logicalHeading;
+    return;
+  }
+
+  if (now < entryAlignPhaseUntil) {
+    return;
+  }
+
+  if (runCornerGyroPidIfNeeded()) {
+    entryAlignedSince = 0;
+    resetPid(entryAlignPid);
+    return;
+  }
+
+  if (currentEntryAlignCentered()) {
+    stopAllServos();
+    resetPid(entryAlignPid);
+
+    if (entryAlignedSince == 0) {
+      entryAlignedSince = now;
+    }
+
+    if (now - entryAlignedSince >= currentEntryAlignHoldMs()) {
+      if (autoAlignResetGyroAfter) {
+        beginMazeSolveAfterEntry();
+      } else {
+        if (autoAlignFinishState == STATE_COMMIT_MOVE) {
+          if (!selectNextHeadingForDecision(autoAlignFinishHeading)) {
+            return;
+          }
+        }
+        finishAutoAlign();
+      }
+    }
+    return;
+  }
+
+  entryAlignedSince = 0;
+  float positionErrorCm = 0.0f;
+  entryAlignMoveDirection = dominantEntryAlignDirection(positionErrorCm);
+  float pidOutputMs = updatePid(entryAlignPid, positionErrorCm);
+  unsigned long nudgeMs = static_cast<unsigned long>(
+    clampFloat(
+      fabs(pidOutputMs),
+      static_cast<float>(currentEntryAlignNudgeMinMs()),
+      static_cast<float>(currentEntryAlignNudgeMaxMs())
+    )
+  );
+
+  entryAlignDirectionSign = positionErrorCm >= 0.0f ? 1 : -1;
+  entryAlignPhase = ENTRY_ALIGN_NUDGE;
+  entryAlignPhaseUntil = now + nudgeMs;
+  driveBodyDirectionWithPower(entryAlignMoveDirection, alignDriveUs);
+}
+
+void runDriveState() {
+  float forwardCm = relativeForwardSafetyDistance();
+
+  if (handleMazeExitIfDetected()) {
+    return;
+  }
+
+  if (forwardCm <= FRONT_HARD_STOP_CM || isFrontBlocked(forwardCm)) {
+    beginCornerHeadingCorrect();
+    return;
+  }
+
+  if (handleSideWallEmergency()) {
+    return;
+  }
+
+  driveRelativeMotionWithCorrections(
+    logicalHeading,
+    computeApproachDrivePower(logicalHeading, forwardCm),
+    computeDriveLateralSignedUs(forwardCm),
+    computeDriveRotateTrimSignedUsForHeading(logicalHeading)
+  );
+}
+
+void runCommitMoveState() {
+  unsigned long elapsed = millis() - stateStartedAt;
+  float forwardCm = relativeForwardSafetyDistance();
+
+  if (handleMazeExitIfDetected()) {
+    return;
+  }
+
+  if (forwardCm <= FRONT_HARD_STOP_CM) {
+    beginCornerHeadingCorrect();
+    return;
+  }
+
+  if (elapsed >= MIN_DIRECTION_CHANGE_MS && isFrontBlocked(forwardCm)) {
+    beginCornerHeadingCorrect();
+    return;
+  }
+
+  if (handleSideWallEmergency()) {
+    return;
+  }
+
+  driveRelativeMotionWithCorrections(
+    logicalHeading,
+    computeApproachDrivePower(logicalHeading, forwardCm),
+    computeDriveLateralSignedUs(forwardCm),
+    computeDriveRotateTrimSignedUsForHeading(logicalHeading)
+  );
+
+  if (elapsed >= MAX_DIRECTION_CHANGE_MS) {
+    clearActiveCorrection();
+    resetMotionControllers();
+    resetHeadingTrimProgress();
+    robotState = STATE_DRIVE;
+    return;
+  }
+
+  if (elapsed < MIN_DIRECTION_CHANGE_MS) {
+    return;
+  }
+
+  if (corridorReadyForNewHeading() && !isFrontBlocked(relativeForwardSafetyDistance())) {
+    clearActiveCorrection();
+    resetMotionControllers();
+    resetHeadingTrimProgress();
+    robotState = STATE_DRIVE;
+  }
+}
+
+void printDebugIfNeeded() {
+  if (!SERIAL_DEBUG) {
+    return;
+  }
+
+  float wallGuideErrorCm = wallAlignPossible() ? wallAlignErrorCm() : 0.0f;
+  int wallGuideSign = signWithDeadband(wallGuideErrorCm, HEADING_WALL_GUIDE_DEADBAND_CM);
+  float headingErrorDeg = normalizeAngle(headingTargetDegrees - yawDegrees);
+
+  unsigned long now = millis();
+  if (now - lastDebugPrint < 250) {
+    return;
+  }
+  lastDebugPrint = now;
+
+  Serial.print(F("Rule="));
+  Serial.print(ruleName(selectedRule));
+  Serial.print(F(" State="));
+  Serial.print(robotState);
+  Serial.print(F(" Head="));
+  Serial.print(bodyDirName(logicalHeading));
+  Serial.print(F(" Dist[F,R,B,L]="));
+  Serial.print(distances.front, 1);
+  Serial.print(',');
+  Serial.print(distances.right, 1);
+  Serial.print(',');
+  Serial.print(distances.back, 1);
+  Serial.print(',');
+  Serial.print(distances.left, 1);
+  Serial.print(F(" Raw[F,R,B,L]="));
+  Serial.print(rawDistances.front, 1);
+  Serial.print(',');
+  Serial.print(rawDistances.right, 1);
+  Serial.print(',');
+  Serial.print(rawDistances.back, 1);
+  Serial.print(',');
+  Serial.print(rawDistances.left, 1);
+  Serial.print(F(" SideErr="));
+  Serial.print(sideBalanceErrorCm(), 2);
+  Serial.print(F(" FBErr="));
+  Serial.print(frontBackAlignErrorCm(), 2);
+  Serial.print(F(" FiltErr="));
+  Serial.print(filteredSideErrorCm, 2);
+  Serial.print(F(" WallGuide="));
+  Serial.print(wallGuideErrorCm, 2);
+  Serial.print('/');
+  Serial.print(wallGuideSign);
+  Serial.print(F(" CorrUs="));
+  Serial.print(activeCorrectionPowerUs);
+  Serial.print(F(" GyroPidUs="));
+  Serial.print(activeGyroTrimUs);
+  Serial.print(F(" Rate="));
+  Serial.print(gyroRateDps, 1);
+  Serial.print(F(" Err="));
+  Serial.print(headingErrorDeg, 1);
+  Serial.print(F(" Yaw="));
+  Serial.println(yawDegrees, 1);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FRONT_TRIG_PIN, OUTPUT);
+  pinMode(FRONT_ECHO_PIN, INPUT);
+  pinMode(RIGHT_TRIG_PIN, OUTPUT);
+  pinMode(RIGHT_ECHO_PIN, INPUT);
+  pinMode(BACK_TRIG_PIN, OUTPUT);
+  pinMode(BACK_ECHO_PIN, INPUT);
+  pinMode(LEFT_TRIG_PIN, OUTPUT);
+  pinMode(LEFT_ECHO_PIN, INPUT);
+
+  pinMode(BUTTON_LEFT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RIGHT_PIN, INPUT_PULLUP);
+
+  servoForward1.attach(SERVO_FORWARD_1_PIN);
+  servoForward2.attach(SERVO_FORWARD_2_PIN);
+  servoSide1.attach(SERVO_SIDE_1_PIN);
+  servoSide2.attach(SERVO_SIDE_2_PIN);
+  stopAllServos();
+
+  initMpu6050();
+  calibrateGyro();
+  refreshSensorsIfNeeded();
+
+  if (SERIAL_DEBUG) {
+    Serial.println(F("Maze solver ready."));
+    Serial.println(F("Press A0 button for LHR or A1 button for RHR."));
+    Serial.println(F("Hold both buttons for Run 3 fastest route after learning."));
+  }
+}
+
+void loop() {
+  updateGyro();
+  refreshSensorsIfNeeded();
+  maybeReanchorHeading();
+  printDebugIfNeeded();
+
+  if (robotState == STATE_WAIT_FOR_RULE || robotState == STATE_FASTEST_DONE) {
+    stopAllServos();
+    maybeSelectRule();
+    return;
+  }
+
+  switch (robotState) {
+    case STATE_ENTRY_FIND_SIDE_WALLS:
+      runEntryFindSideWallsState();
+      break;
+
+    case STATE_ENTRY_AUTO_ALIGN:
+      runEntryAutoAlignState();
+      break;
+
+    case STATE_DRIVE:
+      runDriveState();
+      break;
+
+    case STATE_COMMIT_MOVE:
+      runCommitMoveState();
+      break;
+
+    case STATE_HEADING_CORRECT:
+      runHeadingCorrection();
+      break;
+
+    case STATE_FASTEST_DONE:
+      stopAllServos();
+      break;
+
+    case STATE_WAIT_FOR_RULE:
+    default:
+      break;
+  }
+}
